@@ -25,6 +25,7 @@ int poweroff_main(int argc, char **argv);
 int start_main(int argc, char **argv);
 int stop_main(int argc, char **argv);
 int mksh_main(int argc, char **argv);
+int vdc_main(int argc, char **argv);
 
 struct recovery_cmd {
     const char *name;
