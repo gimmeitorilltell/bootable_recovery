@@ -27,20 +27,34 @@
 #include <linux/fb.h>
 #include <linux/kd.h>
 
+#include <pixelflinger/pixelflinger.h>
+
 #include <png.h>
 
 #include "minui.h"
 
+#ifdef FASTMMI_FEATURE
+char *locale = NULL;
+#else
 extern char* locale;
+#endif
+
+// libpng gives "undefined reference to 'pow'" errors, and I have no
+// idea how to convince the build system to link with -lm.  We don't
+// need this functionality (it's used for gamma adjustment) so provide
+// a dummy implementation to satisfy the linker.
+double pow(double x, double y) {
+    return x * y;
+}
 
 #define SURFACE_DATA_ALIGNMENT 8
 
-static gr_surface malloc_surface(size_t data_size) {
-    unsigned char* temp = malloc(sizeof(GRSurface) + data_size + SURFACE_DATA_ALIGNMENT);
+static GGLSurface* malloc_surface(size_t data_size) {
+    unsigned char* temp = malloc(sizeof(GGLSurface) + data_size + SURFACE_DATA_ALIGNMENT);
     if (temp == NULL) return NULL;
-    gr_surface surface = (gr_surface) temp;
-    surface->data = temp + sizeof(GRSurface) +
-        (SURFACE_DATA_ALIGNMENT - (sizeof(GRSurface) % SURFACE_DATA_ALIGNMENT));
+    GGLSurface* surface = (GGLSurface*) temp;
+    surface->data = temp + sizeof(GGLSurface) +
+        (SURFACE_DATA_ALIGNMENT - (sizeof(GGLSurface) % SURFACE_DATA_ALIGNMENT));
     return surface;
 }
 
@@ -137,16 +151,16 @@ static int open_png(const char* name, png_structp* png_ptr, png_infop* info_ptr,
 
 // Allocate and return a gr_surface sufficient for storing an image of
 // the indicated size in the framebuffer pixel format.
-static gr_surface init_display_surface(png_uint_32 width, png_uint_32 height) {
-    gr_surface surface;
+static GGLSurface* init_display_surface(png_uint_32 width, png_uint_32 height) {
+    GGLSurface* surface;
 
-    surface = malloc_surface(width * height * 4);
+    surface = (GGLSurface*) malloc_surface(width * height * 4);
     if (surface == NULL) return NULL;
 
+    surface->version = sizeof(GGLSurface);
     surface->width = width;
     surface->height = height;
-    surface->row_bytes = width * 4;
-    surface->pixel_bytes = 4;
+    surface->stride = width;
 
     return surface;
 }
@@ -196,8 +210,8 @@ static void transform_rgb_to_draw(unsigned char* input_row,
     }
 }
 
-int res_create_display_surface(const char* name, gr_surface* pSurface) {
-    gr_surface surface = NULL;
+int res_create_surface(const char* name, gr_surface* pSurface) {
+    GGLSurface* surface = NULL;
     int result = 0;
     png_structp png_ptr = NULL;
     png_infop info_ptr = NULL;
@@ -219,11 +233,16 @@ int res_create_display_surface(const char* name, gr_surface* pSurface) {
     unsigned int y;
     for (y = 0; y < height; ++y) {
         png_read_row(png_ptr, p_row, NULL);
-        transform_rgb_to_draw(p_row, surface->data + y * surface->row_bytes, channels, width);
+        transform_rgb_to_draw(p_row, surface->data + y * width * 4, channels, width);
     }
     free(p_row);
 
-    *pSurface = surface;
+    if (channels == 3)
+        surface->format = GGL_PIXEL_FORMAT_RGBX_8888;
+    else
+        surface->format = GGL_PIXEL_FORMAT_RGBA_8888;
+
+    *pSurface = (gr_surface) surface;
 
   exit:
     png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
@@ -265,7 +284,7 @@ int res_create_multi_display_surface(const char* name, int* frames, gr_surface**
         goto exit;
     }
 
-    surface = malloc(*frames * sizeof(gr_surface));
+    surface = malloc(*frames * sizeof(GGLSurface));
     if (surface == NULL) {
         result = -8;
         goto exit;
@@ -283,11 +302,20 @@ int res_create_multi_display_surface(const char* name, int* frames, gr_surface**
     for (y = 0; y < height; ++y) {
         png_read_row(png_ptr, p_row, NULL);
         int frame = y % *frames;
-        unsigned char* out_row = surface[frame]->data +
-            (y / *frames) * surface[frame]->row_bytes;
+        GGLSurface* p = (GGLSurface*) surface[frame];
+        unsigned char* out_row = p->data +
+            (y / *frames) * width * 4;
         transform_rgb_to_draw(p_row, out_row, channels, width);
     }
     free(p_row);
+
+    for (i = 0; i < *frames; ++i) {
+        GGLSurface* p = (GGLSurface*) surface[i];
+        if (channels == 3)
+            p->format = GGL_PIXEL_FORMAT_RGBX_8888;
+        else
+            p->format = GGL_PIXEL_FORMAT_RGBA_8888;
+    }
 
     *pSurface = (gr_surface*) surface;
 
@@ -305,50 +333,7 @@ exit:
     return result;
 }
 
-int res_create_alpha_surface(const char* name, gr_surface* pSurface) {
-    gr_surface surface = NULL;
-    int result = 0;
-    png_structp png_ptr = NULL;
-    png_infop info_ptr = NULL;
-    png_uint_32 width, height;
-    png_byte channels;
-
-    *pSurface = NULL;
-
-    result = open_png(name, &png_ptr, &info_ptr, &width, &height, &channels);
-    if (result < 0) return result;
-
-    if (channels != 1) {
-        result = -7;
-        goto exit;
-    }
-
-    surface = malloc_surface(width * height);
-    if (surface == NULL) {
-        result = -8;
-        goto exit;
-    }
-    surface->width = width;
-    surface->height = height;
-    surface->row_bytes = width;
-    surface->pixel_bytes = 1;
-
-    unsigned char* p_row;
-    unsigned int y;
-    for (y = 0; y < height; ++y) {
-        p_row = surface->data + y * surface->row_bytes;
-        png_read_row(png_ptr, p_row, NULL);
-    }
-
-    *pSurface = surface;
-
-  exit:
-    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-    if (result < 0 && surface != NULL) free(surface);
-    return result;
-}
-
-static int matches_locale(const char* loc, const char* locale) {
+static int matches_locale(const char* loc) {
     if (locale == NULL) return 0;
 
     if (strcmp(loc, locale) == 0) return 1;
@@ -365,61 +350,101 @@ static int matches_locale(const char* loc, const char* locale) {
     return (strncmp(locale, loc, i) == 0 && locale[i] == '_');
 }
 
-int res_create_localized_alpha_surface(const char* name,
-                                       const char* locale,
-                                       gr_surface* pSurface) {
-    gr_surface surface = NULL;
+int res_create_localized_surface(const char* name, gr_surface* pSurface) {
+    char resPath[256];
+    GGLSurface* surface = NULL;
     int result = 0;
+    unsigned char header[8];
     png_structp png_ptr = NULL;
     png_infop info_ptr = NULL;
-    png_uint_32 width, height;
-    png_byte channels;
 
     *pSurface = NULL;
 
-    if (locale == NULL) {
-        surface = malloc_surface(0);
-        surface->width = 0;
-        surface->height = 0;
-        surface->row_bytes = 0;
-        surface->pixel_bytes = 1;
+    snprintf(resPath, sizeof(resPath)-1, "/res/images/%s.png", name);
+    resPath[sizeof(resPath)-1] = '\0';
+    FILE* fp = fopen(resPath, "rb");
+    if (fp == NULL) {
+        result = -1;
         goto exit;
     }
 
-    result = open_png(name, &png_ptr, &info_ptr, &width, &height, &channels);
-    if (result < 0) return result;
+    size_t bytesRead = fread(header, 1, sizeof(header), fp);
+    if (bytesRead != sizeof(header)) {
+        result = -2;
+        goto exit;
+    }
 
-    if (channels != 1) {
-        result = -7;
+    if (png_sig_cmp(header, 0, sizeof(header))) {
+        result = -3;
+        goto exit;
+    }
+
+    png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) {
+        result = -4;
+        goto exit;
+    }
+
+    info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) {
+        result = -5;
+        goto exit;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        result = -6;
+        goto exit;
+    }
+
+    png_init_io(png_ptr, fp);
+    png_set_sig_bytes(png_ptr, sizeof(header));
+    png_read_info(png_ptr, info_ptr);
+
+    int color_type, bit_depth;
+    size_t width, height;
+
+    png_get_IHDR(png_ptr, info_ptr, width, height, &bit_depth,
+            &color_type, NULL, NULL, NULL);
+
+    png_byte* channels = png_get_channels(png_ptr, info_ptr);
+    size_t stride = 4 * width;
+
+    if (!(bit_depth == 8 &&
+          (channels == 1 && color_type == PNG_COLOR_TYPE_GRAY))) {
+        return -7;
         goto exit;
     }
 
     unsigned char* row = malloc(width);
-    png_uint_32 y;
+    int y;
     for (y = 0; y < height; ++y) {
         png_read_row(png_ptr, row, NULL);
         int w = (row[1] << 8) | row[0];
         int h = (row[3] << 8) | row[2];
         int len = row[4];
-        char* loc = (char*)row+5;
+        char* loc = row+5;
 
-        if (y+1+h >= height || matches_locale(loc, locale)) {
+        if (y+1+h >= height || matches_locale(loc)) {
             printf("  %20s: %s (%d x %d @ %d)\n", name, loc, w, h, y);
 
-            surface = malloc_surface(w*h);
+            surface = malloc(sizeof(GGLSurface));
             if (surface == NULL) {
                 result = -8;
                 goto exit;
             }
+            unsigned char* pData = malloc(w*h);
+
+            surface->version = sizeof(GGLSurface);
             surface->width = w;
             surface->height = h;
-            surface->row_bytes = w;
-            surface->pixel_bytes = 1;
+            surface->stride = w; /* Yes, pixels, not bytes */
+            surface->data = pData;
+            surface->format = GGL_PIXEL_FORMAT_A_8;
 
             int i;
             for (i = 0; i < h; ++i, ++y) {
                 png_read_row(png_ptr, row, NULL);
-                memcpy(surface->data + i*w, row, w);
+                memcpy(pData + i*w, row, w);
             }
 
             *pSurface = (gr_surface) surface;
@@ -434,10 +459,21 @@ int res_create_localized_alpha_surface(const char* name,
 
 exit:
     png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-    if (result < 0 && surface != NULL) free(surface);
+
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    if (result < 0) {
+        if (surface) {
+            free(surface);
+        }
+    }
     return result;
 }
 
 void res_free_surface(gr_surface surface) {
-    free(surface);
+    GGLSurface* pSurface = (GGLSurface*) surface;
+    if (pSurface) {
+        free(pSurface);
+    }
 }

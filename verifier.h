@@ -20,6 +20,12 @@
 #include "mincrypt/p256.h"
 #include "mincrypt/rsa.h"
 
+#define ASSUMED_UPDATE_BINARY_NAME  "META-INF/com/google/android/update-binary"
+
+enum { INSTALL_SUCCESS, INSTALL_ERROR, INSTALL_CORRUPT };
+
+static const float VERIFICATION_PROGRESS_FRACTION = 0.25;
+
 typedef struct {
     p256_int x;
     p256_int y;
@@ -42,8 +48,7 @@ typedef struct {
  * is signed and the signature matches one of the given keys.  Return
  * one of the constants below.
  */
-int verify_file(unsigned char* addr, size_t length,
-                const Certificate *pKeys, unsigned int numKeys);
+int verify_file(unsigned char* addr, size_t length);
 
 Certificate* load_keys(const char* filename, int* numKeys);
 

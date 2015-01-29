@@ -21,7 +21,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+/*
 #include "common.h"
+*/
 #include "verifier.h"
 #include "ui.h"
 #include "mincrypt/sha.h"
@@ -237,7 +239,8 @@ int main(int argc, char **argv) {
         return 4;
     }
 
-    int result = verify_file(map.addr, map.length, certs, num_keys);
+    int result = verify_file(map.addr, map.length);
+
     if (result == VERIFY_SUCCESS) {
         printf("VERIFIED\n");
         return 0;

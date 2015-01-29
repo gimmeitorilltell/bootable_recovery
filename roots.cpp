@@ -24,9 +24,11 @@
 #include <ctype.h>
 #include <fcntl.h>
 
+extern "C" {
 #include <fs_mgr.h>
 #include "mtdutils/mtdutils.h"
 #include "mtdutils/mounts.h"
+}
 #include "roots.h"
 #include "common.h"
 #include "make_ext4fs.h"
@@ -75,6 +77,10 @@ Volume* volume_for_path(const char* path) {
 }
 
 int ensure_path_mounted(const char* path) {
+	if (PartitionManager.Mount_By_Path(path, true))
+		return 0;
+	else
+		return -1;
     Volume* v = volume_for_path(path);
     if (v == NULL) {
         LOGE("unknown volume for path [%s]\n", path);
@@ -127,6 +133,10 @@ int ensure_path_mounted(const char* path) {
 }
 
 int ensure_path_unmounted(const char* path) {
+	if (PartitionManager.UnMount_By_Path(path, true))
+		return 0;
+	else
+		return -1;
     Volume* v = volume_for_path(path);
     if (v == NULL) {
         LOGE("unknown volume for path [%s]\n", path);
@@ -169,6 +179,10 @@ static int exec_cmd(const char* path, char* const argv[]) {
 }
 
 int format_volume(const char* volume) {
+	if (PartitionManager.Wipe_By_Path(volume))
+		return 0;
+	else
+		return -1;
     Volume* v = volume_for_path(volume);
     if (v == NULL) {
         LOGE("unknown volume \"%s\"\n", volume);

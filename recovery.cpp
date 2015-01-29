@@ -33,7 +33,11 @@
 #include "bootloader.h"
 #include "common.h"
 #include "cutils/properties.h"
+#ifdef ANDROID_RB_RESTART
 #include "cutils/android_reboot.h"
+#else
+#include <sys/reboot.h>
+#endif
 #include "install.h"
 #include "minui/minui.h"
 #include "minzip/DirUtil.h"
@@ -48,7 +52,19 @@ extern "C" {
 #include "fuse_sdcard_provider.h"
 }
 
+extern "C" {
+#include "data.h"
+#include "gui/gui.h"
+}
+#include "partitions.hpp"
+#include "variables.h"
+#include "openrecoveryscript.hpp"
+#include "twrp-functions.hpp"
+
+TWPartitionManager PartitionManager;
+
 struct selabel_handle *sehandle;
+
 
 static const struct option OPTIONS[] = {
   { "send_intent", required_argument, NULL, 's' },
@@ -260,7 +276,7 @@ set_sdcard_update_bootloader_message() {
 }
 
 // How much of the temp log we have copied to the copy in cache.
-static long tmplog_offset = 0;
+//static long tmplog_offset = 0;
 
 static void
 copy_log_file(const char* source, const char* destination, int append) {
@@ -893,6 +909,10 @@ ui_print(const char* format, ...) {
 
 int
 main(int argc, char **argv) {
+    // Recovery needs to install world-readable files, so clear umask
+    // set by init
+    umask(0);
+
     time_t start = time(NULL);
 
     redirect_stdio(TEMPORARY_LOG_FILE);
@@ -904,15 +924,41 @@ main(int argc, char **argv) {
     // anything in the command file or bootloader control block; the
     // only way recovery should be run with this argument is when it
     // starts a copy of itself from the apply_from_adb() function.
-    if (argc == 2 && strcmp(argv[1], "--adbd") == 0) {
-        adb_main();
+    if (argc == 3 && strcmp(argv[1], "--adbd") == 0) {
+        adb_main(argv[2]);
         return 0;
     }
 
-    printf("Starting recovery (pid %d) on %s", getpid(), ctime(&start));
+<<<<<<< HEAD
+    printf("Starting TWRP %s on %s", TW_VERSION_STR, ctime(&start));
+
+    Device* device = make_device();
+    ui = device->GetUI();
+
+	//ui->Init();
+    //ui->SetBackground(RecoveryUI::NONE);
+    //load_volume_table();
+
+	// Load default values to set DataManager constants and handle ifdefs
+	DataManager_LoadDefaults();
+	printf("Starting the UI...");
+	gui_init();
+	printf("=> Linking mtab\n");
+	symlink("/proc/mounts", "/etc/mtab");
+	printf("=> Processing recovery.fstab\n");
+	if (!PartitionManager.Process_Fstab("/etc/recovery.fstab", 1)) {
+		LOGE("Failing out of recovery due to problem with recovery.fstab.\n");
+		//return -1;
+	}
+	PartitionManager.Output_Partition_Logging();
+	// Load up all the resources
+	gui_loadResources();
+
+	PartitionManager.Mount_By_Path("/cache", true);
 
     load_volume_table();
     ensure_path_mounted(LAST_LOG_FILE);
+
     rotate_last_logs(KEEP_LOG_COUNT);
     get_args(&argc, &argv);
 
@@ -920,6 +966,7 @@ main(int argc, char **argv) {
     const char *update_package = NULL;
     int wipe_data = 0, wipe_cache = 0, show_text = 0;
     bool just_exit = false;
+	bool perform_backup = false;
     bool shutdown_after = false;
 
     int arg;
@@ -980,7 +1027,7 @@ main(int argc, char **argv) {
         ui->Print("Warning: No file_contexts\n");
     }
 
-    device->StartRecovery();
+    //device->StartRecovery();
 
     printf("Command:");
     for (arg = 0; arg < argc; arg++) {
@@ -1008,15 +1055,52 @@ main(int argc, char **argv) {
     property_get("ro.build.display.id", recovery_version, "");
     printf("\n");
 
-    int status = INSTALL_SUCCESS;
+	// Check for and run startup script if script exists
+	TWFunc::check_and_run_script("/sbin/runatboot.sh", "boot");
+	TWFunc::check_and_run_script("/sbin/postrecoveryboot.sh", "boot");
 
+#ifdef TW_INCLUDE_INJECTTWRP
+	// Back up TWRP Ramdisk if needed:
+	TWPartition* Boot = PartitionManager.Find_Partition_By_Path("/boot");
+	LOGI("Backing up TWRP ramdisk...\n");
+	if (Boot == NULL || Boot->Current_File_System != "emmc")
+		TWFunc::Exec_Cmd("injecttwrp --backup /tmp/backup_recovery_ramdisk.img");
+	else {
+		string injectcmd = "injecttwrp --backup /tmp/backup_recovery_ramdisk.img bd=" + Boot->Actual_Block_Device;
+		TWFunc::Exec_Cmd(injectcmd);
+	}
+	LOGI("Backup of TWRP ramdisk done.\n");
+#endif
+
+    int status = INSTALL_SUCCESS;
+	string ORSCommand;
+
+	if (perform_backup) {
+		char empt[50];
+		gui_console_only();
+		strcpy(empt, "(Current Date)");
+		DataManager_SetStrValue(TW_BACKUP_NAME, empt);
+		if (!OpenRecoveryScript::Insert_ORS_Command("backup BSDCAE\n"))
+			status = INSTALL_ERROR;
+	}
+	if (status == INSTALL_SUCCESS) { // Prevent other actions if backup failed
     if (update_package != NULL) {
+		ORSCommand = "install ";
+		ORSCommand += update_package;
+		ORSCommand += "\n";
+
+		if (OpenRecoveryScript::Insert_ORS_Command(ORSCommand))
+			status = INSTALL_SUCCESS;
+		else
+			status = INSTALL_ERROR;
+		/*
         status = install_package(update_package, &wipe_cache, TEMPORARY_INSTALL_FILE, true);
         if (status == INSTALL_SUCCESS && wipe_cache) {
             if (erase_volume("/cache")) {
                 LOGE("Cache wipe (requested by package) failed.");
             }
         }
+
         if (status != INSTALL_SUCCESS) {
             ui->Print("Installation aborted.\n");
 
@@ -1030,18 +1114,66 @@ main(int argc, char **argv) {
             }
         }
     } else if (wipe_data) {
+		if (!OpenRecoveryScript::Insert_ORS_Command("wipe data\n"))
+			status = INSTALL_ERROR;
+		/*
         if (device->WipeData()) status = INSTALL_ERROR;
         if (erase_volume("/data")) status = INSTALL_ERROR;
         if (wipe_cache && erase_volume("/cache")) status = INSTALL_ERROR;
         if (erase_persistent_partition() == -1 ) status = INSTALL_ERROR;
+		*/
         if (status != INSTALL_SUCCESS) ui->Print("Data wipe failed.\n");
     } else if (wipe_cache) {
-        if (wipe_cache && erase_volume("/cache")) status = INSTALL_ERROR;
+        if (!OpenRecoveryScript::Insert_ORS_Command("wipe cache\n"))
+			status = INSTALL_ERROR;
         if (status != INSTALL_SUCCESS) ui->Print("Cache wipe failed.\n");
     } else if (!just_exit) {
         status = INSTALL_NONE;  // No command specified
         ui->SetBackground(RecoveryUI::NO_COMMAND);
     }
+	}
+
+	finish_recovery(NULL);
+	// Offer to decrypt if the device is encrypted
+	if (DataManager_GetIntValue(TW_IS_ENCRYPTED) != 0) {
+		LOGI("Is encrypted, do decrypt page first\n");
+		if (gui_startPage("decrypt") != 0) {
+			LOGE("Failed to start decrypt GUI page.\n");
+		}
+	}
+
+	// Read the settings file
+	DataManager_ReadSettingsFile();
+	// Run any outstanding OpenRecoveryScript
+	if (DataManager_GetIntValue(TW_IS_ENCRYPTED) == 0 && (TWFunc::Path_Exists(SCRIPT_FILE_TMP) || TWFunc::Path_Exists(SCRIPT_FILE_CACHE))) {
+		OpenRecoveryScript::Run_OpenRecoveryScript();
+	}
+	// Launch the main GUI
+	gui_start();
+
+	// Check for su to see if the device is rooted or not
+	if (PartitionManager.Mount_By_Path("/system", false)) {
+		// Disable flashing of stock recovery
+		if (TWFunc::Path_Exists("/system/recovery-from-boot.p") && TWFunc::Path_Exists("/system/etc/install-recovery.sh")) {
+			rename("/system/recovery-from-boot.p", "/system/recovery-from-boot.bak");
+			ui_print("Renamed stock recovery file in /system to prevent\nthe stock ROM from replacing TWRP.\n");
+		}
+		if (TWFunc::Path_Exists("/supersu/su") && !TWFunc::Path_Exists("/system/bin/su") && !TWFunc::Path_Exists("/system/xbin/su") && !TWFunc::Path_Exists("/system/bin/.ext/.su")) {
+			// Device doesn't have su installed
+			DataManager_SetIntValue("tw_busy", 1);
+			if (gui_startPage("installsu") != 0) {
+				LOGE("Failed to start decrypt GUI page.\n");
+			}
+		} else if (TWFunc::Check_su_Perms() > 0) {
+			// su perms are set incorrectly
+			DataManager_SetIntValue("tw_busy", 1);
+			if (gui_startPage("fixsu") != 0) {
+				LOGE("Failed to start decrypt GUI page.\n");
+			}
+		}
+		sync();
+		PartitionManager.UnMount_By_Path("/system", false);
+	}
 
     if (status == INSTALL_ERROR || status == INSTALL_CORRUPT) {
         copy_logs();
@@ -1055,6 +1187,27 @@ main(int argc, char **argv) {
 
     // Save logs and clean up before rebooting or shutting down.
     finish_recovery(send_intent);
+    ui->Print("Rebooting...\n");
+	char backup_arg_char[50];
+	strcpy(backup_arg_char, DataManager_GetStrValue("tw_reboot_arg"));
+	string backup_arg = backup_arg_char;
+	if (backup_arg == "recovery")
+		TWFunc::tw_reboot(rb_recovery);
+	else if (backup_arg == "poweroff")
+		TWFunc::tw_reboot(rb_poweroff);
+	else if (backup_arg == "bootloader")
+		TWFunc::tw_reboot(rb_bootloader);
+	else if (backup_arg == "download")
+		TWFunc::tw_reboot(rb_download);
+	else
+		TWFunc::tw_reboot(rb_system);
+
+#ifdef ANDROID_RB_RESTART
+    android_reboot(ANDROID_RB_RESTART, 0, 0);
+#else
+	reboot(RB_AUTOBOOT);
+#endif
+    property_set(ANDROID_RB_PROPERTY, "reboot,");
 
     switch (after) {
         case Device::SHUTDOWN:

@@ -24,11 +24,10 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <stdio.h>
 
 #include "ui.h"
 #include "cutils/properties.h"
-#include "install.h"
-#include "common.h"
 #include "adb_install.h"
 extern "C" {
 #include "minadbd/fuse_adb_provider.h"
@@ -37,18 +36,28 @@ extern "C" {
 
 static RecoveryUI* ui = NULL;
 
-static void
+void
 set_usb_driver(bool enabled) {
     int fd = open("/sys/class/android_usb/android0/enable", O_WRONLY);
     if (fd < 0) {
+/* These error messages show when built in older Android branches (e.g. Gingerbread)
+   It's not a critical error so we're disabling the error messages.
         ui->Print("failed to open driver control: %s\n", strerror(errno));
+*/
+		printf("failed to open driver control: %s\n", strerror(errno));
         return;
     }
     if (write(fd, enabled ? "1" : "0", 1) < 0) {
+/*
         ui->Print("failed to set driver control: %s\n", strerror(errno));
+*/
+		printf("failed to set driver control: %s\n", strerror(errno));
     }
     if (close(fd) < 0) {
+/*
         ui->Print("failed to close driver control: %s\n", strerror(errno));
+*/
+		printf("failed to close driver control: %s\n", strerror(errno));
     }
 }
 
@@ -59,12 +68,12 @@ stop_adbd() {
 }
 
 
-static void
+void
 maybe_restart_adbd() {
     char value[PROPERTY_VALUE_MAX+1];
     int len = property_get("ro.debuggable", value, NULL);
     if (len == 1 && value[0] == '1') {
-        ui->Print("Restarting adbd...\n");
+        printf("Restarting adbd...\n");
         set_usb_driver(true);
         property_set("ctl.start", "adbd");
     }
@@ -75,20 +84,22 @@ maybe_restart_adbd() {
 #define ADB_INSTALL_TIMEOUT 300
 
 int
-apply_from_adb(RecoveryUI* ui_, int* wipe_cache, const char* install_file) {
-    ui = ui_;
+apply_from_adb(const char* install_file, pid_t* child_pid) {
 
     stop_adbd();
     set_usb_driver(true);
-
+/*
     ui->Print("\n\nNow send the package you want to apply\n"
               "to the device with \"adb sideload <filename>\"...\n");
-
+*/
     pid_t child;
     if ((child = fork()) == 0) {
-        execl("/sbin/recovery", "recovery", "--adbd", NULL);
+        execl("/sbin/recovery", "recovery", "--adbd", install_file, NULL);
         _exit(-1);
     }
+
+    *child_pid = child;
+    // caller can now kill the child thread from another thread
 
     // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the host
     // connects and starts serving a package.  Poll for its
@@ -99,7 +110,7 @@ apply_from_adb(RecoveryUI* ui_, int* wipe_cache, const char* install_file) {
     struct stat st;
     for (int i = 0; i < ADB_INSTALL_TIMEOUT; ++i) {
         if (waitpid(child, &status, WNOHANG) != 0) {
-            result = INSTALL_ERROR;
+            result = -1;
             waited = true;
             break;
         }
@@ -109,15 +120,19 @@ apply_from_adb(RecoveryUI* ui_, int* wipe_cache, const char* install_file) {
                 sleep(1);
                 continue;
             } else {
-                ui->Print("\nTimed out waiting for package.\n\n", strerror(errno));
-                result = INSTALL_ERROR;
+                printf("\nTimed out waiting for package: %s\n\n", strerror(errno));
+                result = -1;
                 kill(child, SIGKILL);
                 break;
             }
         }
-        result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache, install_file, false);
-        break;
+        // Install is handled elsewhere in TWRP
+        //install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache, install_file, false);
+	return 0;
     }
+
+    // if we got here, something failed
+    *child_pid = 0;
 
     if (!waited) {
         // Calling stat() on this magic filename signals the minadbd
@@ -133,9 +148,10 @@ apply_from_adb(RecoveryUI* ui_, int* wipe_cache, const char* install_file) {
 
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         if (WEXITSTATUS(status) == 3) {
-            ui->Print("\nYou need adb 1.0.32 or newer to sideload\nto this device.\n\n");
+            printf("\nYou need adb 1.0.32 or newer to sideload\nto this device.\n\n");
+            result = -2;
         } else if (!WIFSIGNALED(status)) {
-            ui->Print("\n(adbd status %d)\n", WEXITSTATUS(status));
+            printf("status %d\n", WEXITSTATUS(status));
         }
     }
 

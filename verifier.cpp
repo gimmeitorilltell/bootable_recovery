@@ -30,7 +30,9 @@
 #include <stdio.h>
 #include <errno.h>
 
-extern RecoveryUI* ui;
+//extern RecoveryUI* ui;
+
+#define PUBLIC_KEYS_FILE "/res/keys"
 
 /*
  * Simple version of PKCS#7 SignedData extraction. This extracts the
@@ -110,10 +112,16 @@ static bool read_pkcs7(uint8_t* pkcs7_der, size_t pkcs7_der_len, uint8_t** sig_d
 //
 // Return VERIFY_SUCCESS, VERIFY_FAILURE (if any error is encountered
 // or no key matches the signature).
+int verify_file(unsigned char* addr, size_t length) {
+    //ui->SetProgress(0.0);
 
-int verify_file(unsigned char* addr, size_t length,
-                const Certificate* pKeys, unsigned int numKeys) {
-    ui->SetProgress(0.0);
+    int numKeys;
+    Certificate* pKeys = load_keys(PUBLIC_KEYS_FILE, &numKeys);
+    if (pKeys == NULL) {
+        LOGE("Failed to load keys\n");
+        return INSTALL_CORRUPT;
+    }
+    LOGI("%d key(s) loaded from %s\n", numKeys, PUBLIC_KEYS_FILE);
 
     // An archive with a whole-file signature will end in six bytes:
     //
@@ -216,7 +224,7 @@ int verify_file(unsigned char* addr, size_t length,
 
         double f = so_far / (double)signed_len;
         if (f > frac + 0.02 || size == so_far) {
-            ui->SetProgress(f);
+            //ui->SetProgress(f);
             frac = f;
         }
     }
@@ -287,6 +295,7 @@ int verify_file(unsigned char* addr, size_t length,
         } else {
             LOGI("Unknown key type %d\n", pKeys[i].key_type);
         }
+		LOGI("i: %i, eocd_size: %i, RSANUMBYTES: %i\n", i, eocd_size, RSANUMBYTES);
     }
     free(sig_der);
     LOGE("failed to verify whole-file signature\n");

@@ -11,15 +11,19 @@ on early-init
     start ueventd
     start healthd
 
+service set_permissive /sbin/toolbox setenforce 0
+    oneshot
+    seclabel u:r:recovery:s0
+
 on init
     export PATH /sbin:/system/bin
+    export LD_LIBRARY_PATH .:/sbin
     export ANDROID_ROOT /system
     export ANDROID_DATA /data
     export EXTERNAL_STORAGE /sdcard
 
-    symlink /system/etc /etc
-
-    mkdir /sdcard
+    mkdir /boot
+    mkdir /recovery
     mkdir /system
     mkdir /data
     mkdir /cache
@@ -38,9 +42,9 @@ on fs
 
     write /sys/class/android_usb/android0/enable 0
     write /sys/class/android_usb/android0/idVendor 18D1
-    write /sys/class/android_usb/android0/idProduct D001
+    write /sys/class/android_usb/android0/idProduct 4EE2
     write /sys/class/android_usb/android0/f_ffs/aliases adb
-    write /sys/class/android_usb/android0/functions adb
+    write /sys/class/android_usb/android0/functions mtp,adb
     write /sys/class/android_usb/android0/iManufacturer ${ro.product.manufacturer}
     write /sys/class/android_usb/android0/iProduct ${ro.product.model}
     write /sys/class/android_usb/android0/iSerial ${ro.serialno}
@@ -75,6 +79,35 @@ on late-init
 on property:sys.powerctl=*
    powerctl ${sys.powerctl}
 
+on property:sys.storage.ums_enabled=1
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/functions adb,mass_storage
+    write /sys/class/android_usb/android0/enable 1
+
+on property:sys.storage.ums_enabled=0
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/functions ${sys.usb.config}
+    write /sys/class/android_usb/android0/enable ${service.adb.root}
+
+on property:sys.usb.config=none
+    stop adbd
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/bDeviceClass 0
+
+on property:sys.usb.config=mtp,adb
+    stop adbd
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/functions mtp,adb
+    write /sys/class/android_usb/android0/enable 1
+    start adbd
+
+on property:sys.usb.config=adb
+    stop adbd
+    write /sys/class/android_usb/android0/enable 0
+    write /sys/class/android_usb/android0/functions adb
+    write /sys/class/android_usb/android0/enable ${service.adb.root}
+    start adbd
+
 service ueventd /sbin/ueventd
     critical
     seclabel u:r:ueventd:s0
@@ -84,7 +117,6 @@ service healthd /sbin/healthd -r
     seclabel u:r:healthd:s0
 
 service recovery /sbin/recovery
-    seclabel u:r:recovery:s0
 
 service adbd /sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=recovery
     disabled
@@ -93,8 +125,9 @@ service adbd /sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=recovery
 
 # Always start adbd on userdebug and eng builds
 on property:ro.debuggable=1
-    write /sys/class/android_usb/android0/enable 1
-    start adbd
+    #write /sys/class/android_usb/android0/enable 1
+    #start adbd
+    setprop service.adb.root 1
 
 # Restart adbd so it can run as root
 on property:service.adb.root=1
