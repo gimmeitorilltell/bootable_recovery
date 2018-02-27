@@ -719,6 +719,9 @@ int get_menu_selection(bool menu_is_main,
           break;
         case Device::kInvokeItem:
           chosen_item = selected;
+          if (chosen_item < 0) {
+              chosen_item = Device::kGoBack;
+          }
           break;
         case Device::kNoAction:
           break;
@@ -793,7 +796,7 @@ static std::string browse_directory(const std::string& path, Device* device) {
     if (chosen_item == Device::kGoHome) {
       return "@";
     }
-    if (chosen_item == Device::kGoBack || chosen_item == 0) {
+    if (chosen_item == Device::kGoBack) {
       // Go up but continue browsing (if the caller is browse_directory).
       return "";
     }
@@ -1077,7 +1080,7 @@ static int choose_recovery_file(Device* device) {
     chosen_item = get_menu_selection(false, MT_LIST, headers, items,
                                      true, chosen_item, device);
     if (chosen_item == Device::kGoHome ||
-            chosen_item == Device::kGoBack || chosen_item == 0) {
+            chosen_item == Device::kGoBack) {
         break;
     }
 
