@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -67,21 +68,24 @@ static void* run_sdcard_fuse(void* cookie) {
     token* t = reinterpret_cast<token*>(cookie);
 
     struct stat sb;
-    if (stat(path, &sb) == -1) {
-        fprintf(stderr, "failed to stat %s: %s\n", path, strerror(errno));
-        return false;
+    if (stat(t->path, &sb) < 0) {
+        fprintf(stderr, "failed to stat %s: %s\n", t->path, strerror(errno));
+        t->result = -1;
+        return NULL;
     }
 
-    file_data fd;
-    fd.fd = open(path, O_RDONLY);
-    if (fd.fd == -1) {
-        fprintf(stderr, "failed to open %s: %s\n", path, strerror(errno));
-        return false;
+    struct file_data fd;
+    struct provider_vtab vtab;
+
+    fd.fd = open(t->path, O_RDONLY);
+    if (fd.fd < 0) {
+        fprintf(stderr, "failed to open %s: %s\n", t->path, strerror(errno));
+        t->result = -1;
+        return NULL;
     }
     fd.file_size = sb.st_size;
     fd.block_size = 65536;
 
-    provider_vtab vtab;
     vtab.read_block = read_block_file;
     vtab.close = close_file;
 

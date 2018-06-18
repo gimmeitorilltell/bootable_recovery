@@ -24,8 +24,7 @@ LOCAL_SRC_FILES := \
 LOCAL_STATIC_LIBRARIES := \
     libziparchive \
     libselinux \
-    libbase \
-    libziparchive
+    libbase
 
 LOCAL_MODULE := libotautil
 LOCAL_CFLAGS := \

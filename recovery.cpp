@@ -30,7 +30,6 @@
 #include <sys/klog.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1156,26 +1155,12 @@ static int apply_from_storage(Device* device, const std::string& id, bool* wipe_
 
     ui->Print("\n-- Install %s ...\n", path.c_str());
     set_sdcard_update_bootloader_message();
+    void* token = start_sdcard_fuse(path.c_str());
 
     vdc->volumeUnmount(vi.mId, true);
 
     status = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
                                  TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/);
-        break;
-    }
-
-    if (!waited) {
-        // Calling stat() on this magic filename signals the fuse
-        // filesystem to shut down.
-        struct stat sb;
-        stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &sb);
-
-        waitpid(child, &status, 0);
-    }
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
-    }
 
     finish_sdcard_fuse(token);
     return status;

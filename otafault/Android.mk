@@ -32,7 +32,7 @@ LOCAL_CFLAGS := \
 LOCAL_SRC_FILES := config.cpp ota_io.cpp
 LOCAL_MODULE_TAGS := eng
 LOCAL_MODULE := libotafault
-LOCAL_C_INCLUDES := bootable/recovery
+LOCAL_C_INCLUDES := $(call project-path-for,recovery)
 LOCAL_EXPORT_C_INCLUDE_DIRS := $(LOCAL_PATH)
 LOCAL_WHOLE_STATIC_LIBRARIES := $(otafault_static_libs)
 

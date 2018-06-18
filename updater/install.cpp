@@ -394,7 +394,8 @@ Value* FormatFn(const char* name, State* state, const std::vector<std::unique_pt
 //   Example: rename("system/app/Hangouts/Hangouts.apk", "system/priv-app/Hangouts/Hangouts.apk")
 Value* RenameFn(const char* name, State* state, const std::vector<std::unique_ptr<Expr>>& argv) {
   if (argv.size() != 2) {
-    return ErrorAbort(state, kArgsParsingFailure, "%s() expects 2 args, got %zu", name, argv.size());
+    return ErrorAbort(state, kArgsParsingFailure, "%s() expects 2 args, got %zu", name,
+                      argv.size());
   }
 
   std::vector<std::string> args;
@@ -431,18 +432,16 @@ Value* RenameFn(const char* name, State* state, const std::vector<std::unique_pt
 //   Recursively deletes dirnames and all their contents. Returns the number of directories
 //   successfully deleted.
 Value* DeleteFn(const char* name, State* state, const std::vector<std::unique_ptr<Expr>>& argv) {
-  std::vector<std::string> paths(argv.size());
-  for (size_t i = 0; i < argv.size(); ++i) {
-    if (!Evaluate(state, argv[i], &paths[i])) {
-      return nullptr;
-    }
+  std::vector<std::string> paths;
+  if (!ReadArgs(state, argv, &paths)) {
+    return nullptr;
   }
 
   bool recursive = (strcmp(name, "delete_recursive") == 0);
 
   int success = 0;
-  for (size_t i = 0; i < argv.size(); ++i) {
-    if ((recursive ? dirUnlinkHierarchy(paths[i].c_str()) : unlink(paths[i].c_str())) == 0) {
+  for (const auto& path : paths) {
+    if ((recursive ? dirUnlinkHierarchy(path.c_str()) : unlink(path.c_str())) == 0) {
       ++success;
     }
   }
