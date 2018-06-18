@@ -1,4 +1,6 @@
 # Copyright (C) 2007 The Android Open Source Project
+# Copyright (C) 2015 The CyanogenMod Project
+# Copyright (C) 2017 The Lineage Android Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -81,6 +83,11 @@ LOCAL_SRC_FILES := \
     ui.cpp \
     vr_ui.cpp \
     wear_ui.cpp \
+    voldclient.cpp
+
+# External tools
+LOCAL_SRC_FILES += \
+    ../../system/vold/vdc.cpp
 
 LOCAL_MODULE := recovery
 
@@ -90,7 +97,7 @@ LOCAL_REQUIRED_MODULES := e2fsdroid_static mke2fs_static mke2fs.conf
 
 ifeq ($(TARGET_USERIMAGES_USE_F2FS),true)
 ifeq ($(HOST_OS),linux)
-LOCAL_REQUIRED_MODULES += mkfs.f2fs
+LOCAL_REQUIRED_MODULES += sload.f2fs mkfs.f2fs
 endif
 endif
 
@@ -147,16 +154,26 @@ endif
 
 LOCAL_C_INCLUDES += \
     system/vold \
+    external/e2fsprogs/lib
 
 LOCAL_STATIC_LIBRARIES := \
+    libmksh_driver \
     librecovery \
     libverifier \
     libbatterymonitor \
     libbootloader_message \
     libfs_mgr \
     libext4_utils \
+    libext2_blkid \
+    libext2_uuid \
     libsparse \
+    libreboot \
     libziparchive \
+    libminipigz_static \
+    libzopfli_static \
+    libminizip_static \
+    libminiunz_static \
+    libsdcard \
     libotautil \
     libmounts \
     libz \
@@ -177,13 +194,79 @@ LOCAL_STATIC_LIBRARIES := \
     libm \
     libc
 
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libawk_main
+
+# Libraries for FS tools
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libfuse_static
+
+ifneq ($(TARGET_EXFAT_DRIVER),)
+LOCAL_CFLAGS += -DWITH_EXFAT
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libexfat_static \
+    libexfat_fsck_static \
+    libexfat_mkfs_static
+endif
+
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libntfs-3g_static \
+    libntfs3g_fsck_static \
+    libntfs3g_mkfs_main \
+    libntfs3g_mount_static
+
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libext2fs \
+    libe2fsck \
+    libmke2fs \
+    libresize2fs \
+    libtune2fs \
+    libsparse
+
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libf2fs \
+    libf2fs_fsck \
+    libf2fs_mkfs
+
+LOCAL_WHOLE_STATIC_LIBRARIES += \
+    libsgdisk_static
+
+LOCAL_STATIC_LIBRARIES += \
+    libext2_blkid \
+    libext2_uuid \
+    libext2_profile \
+    libext2_quota \
+    libext2_com_err \
+    libext2_e2p \
+    libc++_static \
+    libz
+
+FILESYSTEM_TOOLS := \
+    e2fsck mke2fs resize2fs tune2fs fsck.ext4 mkfs.ext4 \
+    fsck.ntfs mkfs.ntfs mount.ntfs \
+    mkfs.f2fs fsck.f2fs \
+    sgdisk
+
+ifneq ($(TARGET_EXFAT_DRIVER),)
+FILESYSTEM_TOOLS += \
+    fsck.exfat mkfs.exfat
+endif
+
 LOCAL_HAL_STATIC_LIBRARIES := libhealthd
 
 ifeq ($(AB_OTA_UPDATER),true)
     LOCAL_CFLAGS += -DAB_OTA_UPDATER=1
 endif
 
+ifeq ($(BOARD_HAS_DOWNLOAD_MODE), true)
+    LOCAL_CFLAGS += -DDOWNLOAD_MODE
+endif
+
 LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
+
+LOCAL_CFLAGS += -DMINIVOLD
+LOCAL_C_INCLUDES += system/extras/ext4_utils system/core/fs_mgr/include external/fsck_msdos
+LOCAL_C_INCLUDES += system/vold
 
 ifeq ($(TARGET_RECOVERY_UI_LIB),)
   LOCAL_SRC_FILES += default_device.cpp
@@ -195,7 +278,123 @@ ifeq ($(BOARD_CACHEIMAGE_PARTITION_SIZE),)
 LOCAL_REQUIRED_MODULES += recovery-persist recovery-refresh
 endif
 
+LOCAL_REQUIRED_MODULES += \
+    toybox_static \
+    recovery_mkshrc \
+    minivold \
+    bu_recovery
+
+# Symlinks
+RECOVERY_TOOLS := \
+    reboot \
+    setup_adbd \
+    sh \
+    gunzip \
+    gzip \
+    unzip \
+    zip \
+    vdc \
+    awk \
+    $(FILESYSTEM_TOOLS)
+LOCAL_POST_INSTALL_CMD := $(hide) $(foreach t,$(RECOVERY_TOOLS),ln -sf ${LOCAL_MODULE} $(LOCAL_MODULE_PATH)/$(t);)
+
+ifneq ($(TARGET_RECOVERY_DEVICE_MODULES),)
+    LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_RECOVERY_DEVICE_MODULES)
+endif
+
 include $(BUILD_EXECUTABLE)
+
+# mkshrc
+include $(CLEAR_VARS)
+LOCAL_MODULE := recovery_mkshrc
+LOCAL_MODULE_TAGS := optional
+LOCAL_MODULE_CLASS := ETC
+LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/etc
+LOCAL_SRC_FILES := etc/mkshrc
+LOCAL_MODULE_STEM := mkshrc
+include $(BUILD_PREBUILT)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := bu_recovery
+LOCAL_MODULE_STEM := bu
+LOCAL_MODULE_TAGS := optional
+LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
+LOCAL_FORCE_STATIC_EXECUTABLE := true
+LOCAL_SRC_FILES := \
+    bu.cpp \
+    backup.cpp \
+    restore.cpp \
+    roots.cpp \
+    voldclient.cpp
+LOCAL_CFLAGS += -DMINIVOLD
+LOCAL_CFLAGS += -Wno-unused-parameter
+LOCAL_STATIC_LIBRARIES += \
+    libext4_utils \
+    libext2_blkid \
+    libext2_uuid \
+    libsparse \
+    libmounts \
+    libz \
+    libminadbd \
+    libminui \
+    libfs_mgr \
+    libtar \
+    libcrypto \
+    libbase \
+    libcutils \
+    libutils \
+    liblog \
+    libselinux \
+    libm \
+    libc
+
+LOCAL_C_INCLUDES += \
+    system/core/fs_mgr/include \
+    system/core/include \
+    system/core/libcutils \
+    system/extras/ext4_utils \
+    system/vold \
+    external/libtar \
+    external/libtar/listhash \
+    external/openssl/include \
+    external/zlib \
+    bionic/libc/bionic \
+    external/e2fsprogs/lib
+
+include $(BUILD_EXECUTABLE)
+
+# Minizip static library
+include $(CLEAR_VARS)
+LOCAL_MODULE := libminizip_static
+LOCAL_MODULE_TAGS := optional
+LOCAL_CFLAGS := -Dmain=minizip_main -D__ANDROID__ -DIOAPI_NO_64
+LOCAL_C_INCLUDES := external/zlib
+LOCAL_SRC_FILES := \
+    ../../external/zlib/src/contrib/minizip/ioapi.c \
+    ../../external/zlib/src/contrib/minizip/minizip.c \
+    ../../external/zlib/src/contrib/minizip/zip.c
+include $(BUILD_STATIC_LIBRARY)
+
+# Miniunz static library
+include $(CLEAR_VARS)
+LOCAL_MODULE := libminiunz_static
+LOCAL_MODULE_TAGS := optional
+LOCAL_CFLAGS := -Dmain=miniunz_main -D__ANDROID__ -DIOAPI_NO_64
+LOCAL_C_INCLUDES := external/zlib
+LOCAL_SRC_FILES := \
+    ../../external/zlib/src/contrib/minizip/ioapi.c \
+    ../../external/zlib/src/contrib/minizip/miniunz.c \
+    ../../external/zlib/src/contrib/minizip/unzip.c
+include $(BUILD_STATIC_LIBRARY)
+
+# Reboot static library
+include $(CLEAR_VARS)
+LOCAL_MODULE := libreboot
+LOCAL_MODULE_TAGS := optional
+LOCAL_CFLAGS := -Dmain=reboot_main
+LOCAL_SRC_FILES := ../../system/core/reboot/reboot.c
+include $(BUILD_STATIC_LIBRARY)
+
 
 # recovery-persist (system partition dynamic executable run after /data mounts)
 # ===============================

@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <setjmp.h>
 
 #include <algorithm>
 #include <atomic>
@@ -47,6 +48,8 @@
 #include <android-base/strings.h>
 #include <vintf/VintfObjectRecovery.h>
 #include <ziparchive/zip_archive.h>
+
+#include <cutils/properties.h>
 
 #include "common.h"
 #include "error_code.h"
@@ -301,6 +304,12 @@ static void log_max_temperature(int* max_temperature, const std::atomic<bool>& l
   }
 }
 
+static jmp_buf jb;
+static void sig_bus(int)
+{
+    longjmp(jb, 1);
+}
+
 // If the package contains an update binary, extract it and run it.
 static int try_update_binary(const std::string& package, ZipArchiveHandle zip, bool* wipe_cache,
                              std::vector<std::string>* log_buffer, int retry_count,
@@ -549,7 +558,7 @@ bool verify_package_compatibility(ZipArchiveHandle package_zip) {
   return false;
 }
 
-static int really_install_package(const std::string& path, bool* wipe_cache, bool needs_mount,
+static int really_install_package(std::string path, bool* wipe_cache, bool needs_mount,
                                   std::vector<std::string>* log_buffer, int retry_count,
                                   int* max_temperature) {
   ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
@@ -557,6 +566,23 @@ static int really_install_package(const std::string& path, bool* wipe_cache, boo
   // Give verification half the progress bar...
   ui->SetProgressType(RecoveryUI::DETERMINATE);
   ui->ShowProgress(VERIFICATION_PROGRESS_FRACTION, VERIFICATION_PROGRESS_TIME);
+
+    // Resolve symlink in case legacy /sdcard path is used
+    // Requires: symlink uses absolute path
+    if (path.size() > 1) {
+      size_t root_pos = path.find('/', 1);
+      if (root_pos != std::string::npos) {
+        char link_path[PATH_MAX];
+        ssize_t link_len;
+        memset(link_path, 0, sizeof(link_path));
+        link_len = readlink(path.substr(0, root_pos).c_str(),
+                            link_path, sizeof(link_path)-1);
+        if (link_len > 0) {
+          path = link_path + path.substr(root_pos);
+        }
+      }
+    }
+
   LOG(INFO) << "Update location: " << path;
 
   // Map the update package into memory.
@@ -577,8 +603,10 @@ static int really_install_package(const std::string& path, bool* wipe_cache, boo
   }
 
   // Verify package.
+  set_perf_mode(true);
   if (!verify_package(map.addr, map.length)) {
     log_buffer->push_back(android::base::StringPrintf("error: %d", kZipVerificationFailure));
+    set_perf_mode(false);
     return INSTALL_CORRUPT;
   }
 
@@ -590,6 +618,7 @@ static int really_install_package(const std::string& path, bool* wipe_cache, boo
     log_buffer->push_back(android::base::StringPrintf("error: %d", kZipOpenFailure));
 
     CloseArchive(zip);
+    set_perf_mode(false);
     return INSTALL_CORRUPT;
   }
 
@@ -611,6 +640,7 @@ static int really_install_package(const std::string& path, bool* wipe_cache, boo
   ui->Print("\n");
 
   CloseArchive(zip);
+  set_perf_mode(false);
   return result;
 }
 
@@ -702,14 +732,30 @@ bool verify_package(const unsigned char* package_data, size_t package_size) {
   // Verify package.
   ui->Print("Verifying update package...\n");
   auto t0 = std::chrono::system_clock::now();
-  int err = verify_file(package_data, package_size, loadedKeys,
-                        std::bind(&RecoveryUI::SetProgress, ui, std::placeholders::_1));
-  std::chrono::duration<double> duration = std::chrono::system_clock::now() - t0;
-  ui->Print("Update package verification took %.1f s (result %d).\n", duration.count(), err);
+  int err;
+  // Because we mmap() the update file which is backed by FUSE, we get
+  // SIGBUS when the host aborts the transfer.  We handle this by using
+  // setjmp/longjmp.
+  signal(SIGBUS, sig_bus);
+  if (setjmp(jb) == 0) {
+    err = verify_file(package_data, package_size, loadedKeys,
+                      std::bind(&RecoveryUI::SetProgress, ui, std::placeholders::_1));
+    std::chrono::duration<double> duration = std::chrono::system_clock::now() - t0;
+    ui->Print("Update package verification took %.1f s (result %d).\n", duration.count(), err);
+  } else {
+    err = VERIFY_FAILURE;
+  }
+  signal(SIGBUS, SIG_DFL);
+
   if (err != VERIFY_SUCCESS) {
     LOG(ERROR) << "Signature verification failed";
     LOG(ERROR) << "error: " << kZipVerificationFailure;
     return false;
   }
   return true;
+}
+
+void
+set_perf_mode(bool enable) {
+    property_set("recovery.perf.mode", enable ? "1" : "0");
 }

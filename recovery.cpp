@@ -30,7 +30,6 @@
 #include <sys/klog.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,6 +72,16 @@
 #include "screen_ui.h"
 #include "stub_ui.h"
 #include "ui.h"
+#include "voldclient.h"
+
+// For e2fsprogs
+extern "C" {
+const char* program_name = "fstools";
+}
+
+extern "C" {
+#include "recovery_cmds.h"
+}
 
 static const struct option OPTIONS[] = {
   { "update_package", required_argument, NULL, 'u' },
@@ -108,7 +117,6 @@ static const char *CONVERT_FBE_DIR = "/tmp/convert_fbe";
 static const char *CONVERT_FBE_FILE = "/tmp/convert_fbe/convert_fbe";
 static const char *CACHE_ROOT = "/cache";
 static const char *DATA_ROOT = "/data";
-static const char *SDCARD_ROOT = "/sdcard";
 static const char *TEMPORARY_LOG_FILE = "/tmp/recovery.log";
 static const char *TEMPORARY_INSTALL_FILE = "/tmp/last_install";
 static const char *LAST_KMSG_FILE = "/cache/recovery/last_kmsg";
@@ -127,6 +135,12 @@ static constexpr const char* DEFAULT_LOCALE = "en-US";
 
 static std::string locale;
 static bool has_cache = false;
+
+static const char* adb_keys_data = "/data/misc/adb/adb_keys";
+static const char* adb_keys_root = "/adb_keys";
+static const char* time_off_1_data = "/data/time/ats_1";
+static const char* time_off_2_data = "/data/system/time/ats_1";
+static const char* time_off_root = "/ats";
 
 RecoveryUI* ui = nullptr;
 bool modified_flash = false;
@@ -204,6 +218,39 @@ static void check_and_fclose(FILE *fp, const char *name) {
         PLOG(ERROR) << "Error in " << name;
     }
     fclose(fp);
+}
+
+static bool file_copy(const char* src, const char* dst) {
+    bool ret = false;
+    char tmpdst[PATH_MAX];
+    FILE* sfp;
+    FILE* dfp;
+    char buf[4096];
+
+    snprintf(tmpdst, sizeof(tmpdst), "%s.tmp", dst);
+    sfp = fopen(src, "r");
+    dfp = fopen(tmpdst, "w");
+    if (sfp && dfp) {
+        char buf[4096];
+        size_t nr, nw;
+        while ((nr = fread(buf, 1, sizeof(buf), sfp)) != 0) {
+            nw = fwrite(buf, 1, nr, dfp);
+            if (nr != nw)
+                break;
+        }
+        ret = (!ferror(sfp) && !ferror(dfp));
+    }
+    if (dfp) fclose(dfp);
+    if (sfp) fclose(sfp);
+
+    if (ret) {
+        ret = (rename(tmpdst, dst) == 0);
+    }
+    else {
+        unlink(tmpdst);
+    }
+
+    return ret;
 }
 
 bool is_ro_debuggable() {
@@ -522,9 +569,6 @@ static bool erase_volume(const char* volume) {
   bool is_cache = (strcmp(volume, CACHE_ROOT) == 0);
   bool is_data = (strcmp(volume, DATA_ROOT) == 0);
 
-  ui->SetBackground(RecoveryUI::ERASING);
-  ui->SetProgressType(RecoveryUI::INDETERMINATE);
-
   std::vector<saved_log_file> log_files;
 
   if (is_cache) {
@@ -566,6 +610,9 @@ static bool erase_volume(const char* volume) {
   }
 
   ui->Print("Formatting %s...\n", volume);
+
+  ui->SetBackground(RecoveryUI::ERASING);
+  ui->SetProgressType(RecoveryUI::INDETERMINATE);
 
   ensure_path_unmounted(volume);
 
@@ -619,18 +666,22 @@ static bool erase_volume(const char* volume) {
 // return a positive number beyond the given range. Caller sets 'menu_only' to true to ensure only
 // a menu item gets selected. 'initial_selection' controls the initial cursor location. Returns the
 // (non-negative) chosen item number, or -1 if timed out waiting for input.
-static int get_menu_selection(const char* const* headers, const char* const* items, bool menu_only,
-                              int initial_selection, Device* device) {
+int get_menu_selection(bool menu_is_main,
+                       menu_type_t menu_type,
+                       const char* const* headers,
+                       const MenuItemVector& menu_items,
+                       bool menu_only,
+                       int initial_selection, Device* device) {
   // Throw away keys pressed previously, so user doesn't accidentally trigger menu items.
   ui->FlushKeys();
 
-  ui->StartMenu(headers, items, initial_selection);
+  ui->StartMenu(menu_is_main, menu_type, headers, menu_items, initial_selection);
 
   int selected = initial_selection;
   int chosen_item = -1;
   while (chosen_item < 0) {
-    int key = ui->WaitKey();
-    if (key == -1) {  // WaitKey() timed out.
+    RecoveryUI::InputEvent evt = ui->WaitInputEvent();
+    if (evt.type() == RecoveryUI::EVENT_TYPE_NONE) {  // WaitKey() timed out.
       if (ui->WasTextEverVisible()) {
         continue;
       } else {
@@ -640,8 +691,21 @@ static int get_menu_selection(const char* const* headers, const char* const* ite
       }
     }
 
-    bool visible = ui->IsTextVisible();
-    int action = device->HandleMenuKey(key, visible);
+    int action = Device::kNoAction;
+    if (evt.type() == RecoveryUI::EVENT_TYPE_TOUCH) {
+      int touch_sel = ui->SelectMenu(evt.pos());
+      if (touch_sel < 0) {
+        action = touch_sel;
+      }
+      else {
+        action = Device::kInvokeItem;
+        selected = touch_sel;
+      }
+    }
+    else {
+      bool visible = ui->IsTextVisible();
+      action = device->HandleMenuKey(evt.key(), visible);
+    }
 
     if (action < 0) {
       switch (action) {
@@ -653,23 +717,41 @@ static int get_menu_selection(const char* const* headers, const char* const* ite
           break;
         case Device::kInvokeItem:
           chosen_item = selected;
+          if (chosen_item < 0) {
+              chosen_item = Device::kGoBack;
+          }
           break;
         case Device::kNoAction:
+          break;
+        case Device::kGoBack:
+          chosen_item = Device::kGoBack;
+          break;
+        case Device::kGoHome:
+          chosen_item = Device::kGoHome;
+          break;
+        case Device::kRefresh:
+          chosen_item = Device::kRefresh;
           break;
       }
     } else if (!menu_only) {
       chosen_item = action;
     }
+    if (chosen_item == Device::kGoBack ||
+        chosen_item == Device::kGoHome ||
+        chosen_item == Device::kRefresh) {
+      break;
+    }
   }
 
   ui->EndMenu();
+  if (chosen_item == Device::kGoHome) {
+    device->GoHome();
+  }
   return chosen_item;
 }
 
 // Returns the selected filename, or an empty string.
 static std::string browse_directory(const std::string& path, Device* device) {
-  ensure_path_mounted(path.c_str());
-
   std::unique_ptr<DIR, decltype(&closedir)> d(opendir(path.c_str()), closedir);
   if (!d) {
     PLOG(ERROR) << "error opening " << path;
@@ -698,23 +780,29 @@ static std::string browse_directory(const std::string& path, Device* device) {
   // Append dirs to the zips list.
   zips.insert(zips.end(), dirs.begin(), dirs.end());
 
-  const char* entries[zips.size() + 1];
-  entries[zips.size()] = nullptr;
+  MenuItemVector items;
   for (size_t i = 0; i < zips.size(); i++) {
-    entries[i] = zips[i].c_str();
+    items.push_back(MenuItem(zips[i]));
   }
 
   const char* headers[] = { "Choose a package to install:", path.c_str(), nullptr };
 
   int chosen_item = 0;
   while (true) {
-    chosen_item = get_menu_selection(headers, entries, true, chosen_item, device);
-
-    const std::string& item = zips[chosen_item];
-    if (chosen_item == 0) {
+    chosen_item = get_menu_selection(false, MT_LIST, headers, items,
+                                     true, chosen_item, device);
+    if (chosen_item == Device::kGoHome) {
+      return "@";
+    }
+    if (chosen_item == Device::kGoBack) {
       // Go up but continue browsing (if the caller is browse_directory).
       return "";
     }
+    if (chosen_item == Device::kRefresh) {
+      return "@refresh";
+    }
+
+    const std::string& item = zips[chosen_item];
 
     std::string new_path = path + "/" + item;
     if (new_path.back() == '/') {
@@ -733,9 +821,13 @@ static std::string browse_directory(const std::string& path, Device* device) {
 
 static bool yes_no(Device* device, const char* question1, const char* question2) {
     const char* headers[] = { question1, question2, NULL };
-    const char* items[] = { " No", " Yes", NULL };
+    const MenuItemVector items = {
+      MenuItem(" No"),
+      MenuItem(" Yes"),
+    };
 
-    int chosen_item = get_menu_selection(headers, items, true, 0, device);
+    int chosen_item = get_menu_selection(false, MT_LIST, headers, items,
+                                         true, 0, device);
     return (chosen_item == 1);
 }
 
@@ -766,13 +858,14 @@ static bool prompt_and_wipe_data(Device* device) {
     "stored on this device.",
     nullptr
   };
-  const char* const items[] = {
-    "Try again",
-    "Factory data reset",
-    NULL
+  const MenuItemVector items = {
+    MenuItem("Try again"),
+    MenuItem("Factory data reset"),
   };
+
   for (;;) {
-    int chosen_item = get_menu_selection(headers, items, true, 0, device);
+    int chosen_item = get_menu_selection(false, MT_LIST, headers, items,
+                                         true, 0, device);
     if (chosen_item != 1) {
       return true;  // Just reboot, no wipe; not a failure, user asked for it
     }
@@ -798,6 +891,20 @@ static bool wipe_cache(bool should_confirm, Device* device) {
     ui->Print("\n-- Wiping cache...\n");
     bool success = erase_volume("/cache");
     ui->Print("Cache wipe %s.\n", success ? "complete" : "failed");
+    return success;
+}
+
+static bool ask_to_wipe_system(Device* device) {
+    return yes_no(device, "Wipe system?", "  THIS CAN NOT BE UNDONE!");
+}
+
+// Return true on success.
+static bool wipe_system(Device* device) {
+    modified_flash = true;
+
+    ui->Print("\n-- Wiping system...\n");
+    bool success = erase_volume("/system");
+    ui->Print("System wipe %s.\n", success ? "complete" : "failed");
     return success;
 }
 
@@ -930,8 +1037,11 @@ static bool wipe_ab_device(size_t wipe_package_size) {
     return true;
 }
 
-static void choose_recovery_file(Device* device) {
+static int choose_recovery_file(Device* device) {
   std::vector<std::string> entries;
+  if (access(TEMPORARY_LOG_FILE, R_OK) != -1) {
+    entries.push_back(TEMPORARY_LOG_FILE);
+  }
   if (has_cache) {
     for (int i = 0; i < KEEP_LOG_COUNT; i++) {
       auto add_to_entries = [&](const char* filename) {
@@ -951,64 +1061,62 @@ static void choose_recovery_file(Device* device) {
       // Add LAST_KMSG_FILE + LAST_KMSG_FILE.x
       add_to_entries(LAST_KMSG_FILE);
     }
-  } else {
-    // If cache partition is not found, view /tmp/recovery.log instead.
-    if (access(TEMPORARY_LOG_FILE, R_OK) == -1) {
-      return;
-    } else {
-      entries.push_back(TEMPORARY_LOG_FILE);
-    }
+  }
+  if (entries.empty()) {
+    // Should never happen
+    return Device::kNoAction;
   }
 
-  entries.push_back("Back");
-
-  std::vector<const char*> menu_entries(entries.size());
-  std::transform(entries.cbegin(), entries.cend(), menu_entries.begin(),
-                 [](const std::string& entry) { return entry.c_str(); });
-  menu_entries.push_back(nullptr);
+  MenuItemVector items(entries.size());
+  std::transform(entries.cbegin(), entries.cend(), items.begin(),
+                 [](const std::string& entry) { return MenuItem(entry.c_str()); });
 
   const char* headers[] = { "Select file to view", nullptr };
 
   int chosen_item = 0;
   while (true) {
-    chosen_item = get_menu_selection(headers, menu_entries.data(), true, chosen_item, device);
-    if (entries[chosen_item] == "Back") break;
+    chosen_item = get_menu_selection(false, MT_LIST, headers, items,
+                                     true, chosen_item, device);
+    if (chosen_item == Device::kGoHome ||
+            chosen_item == Device::kGoBack) {
+        break;
+    }
 
-    ui->ShowFile(entries[chosen_item].c_str());
+    int key = ui->ShowFile(entries[chosen_item].c_str());
+    if (key == KEY_HOME || key == KEY_HOMEPAGE) {
+        chosen_item = Device::kGoHome;
+        break;
+    }
   }
+  return chosen_item;
 }
 
 static void run_graphics_test() {
-  // Switch to graphics screen.
-  ui->ShowText(false);
-
-  ui->SetProgressType(RecoveryUI::INDETERMINATE);
-  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
-  sleep(1);
-
   ui->SetBackground(RecoveryUI::ERROR);
+  ui->Redraw();
   sleep(1);
 
-  ui->SetBackground(RecoveryUI::NO_COMMAND);
+  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
+  ui->Redraw();
   sleep(1);
 
   ui->SetBackground(RecoveryUI::ERASING);
+  ui->Redraw();
   sleep(1);
 
-  // Calling SetBackground() after SetStage() to trigger a redraw.
   ui->SetStage(1, 3);
-  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
+  ui->Redraw();
   sleep(1);
   ui->SetStage(2, 3);
-  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
+  ui->Redraw();
   sleep(1);
   ui->SetStage(3, 3);
-  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
+  ui->Redraw();
   sleep(1);
 
   ui->SetStage(-1, -1);
-  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
 
+  ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
   ui->SetProgressType(RecoveryUI::DETERMINATE);
   ui->ShowProgress(1.0, 10.0);
   float fraction = 0.0;
@@ -1017,87 +1125,89 @@ static void run_graphics_test() {
     ui->SetProgress(fraction);
     usleep(100000);
   }
-
-  ui->ShowText(true);
 }
 
-// How long (in seconds) we wait for the fuse-provided package file to
-// appear, before timing out.
-#define SDCARD_INSTALL_TIMEOUT 10
-
-static int apply_from_sdcard(Device* device, bool* wipe_cache) {
+static int apply_from_storage(Device* device, const std::string& id, bool* wipe_cache) {
     modified_flash = true;
 
-    if (ensure_path_mounted(SDCARD_ROOT) != 0) {
-        ui->Print("\n-- Couldn't mount %s.\n", SDCARD_ROOT);
+    int status;
+
+    if (!vdc->volumeMount(id)) {
         return INSTALL_ERROR;
     }
 
-    std::string path = browse_directory(SDCARD_ROOT, device);
+    VolumeInfo vi = vdc->getVolume(id);
+
+    std::string path;
+    do {
+        path = browse_directory(vi.mInternalPath, device);
+        if (path == "@") {
+            return INSTALL_NONE;
+        }
+    }
+    while (path == "@refresh");
+
     if (path.empty()) {
         ui->Print("\n-- No package file selected.\n");
-        ensure_path_unmounted(SDCARD_ROOT);
-        return INSTALL_ERROR;
+        vdc->volumeUnmount(vi.mId);
+        return INSTALL_NONE;
     }
 
     ui->Print("\n-- Install %s ...\n", path.c_str());
     set_sdcard_update_bootloader_message();
+    void* token = start_sdcard_fuse(path.c_str());
 
-    // We used to use fuse in a thread as opposed to a process. Since accessing
-    // through fuse involves going from kernel to userspace to kernel, it leads
-    // to deadlock when a page fault occurs. (Bug: 26313124)
-    pid_t child;
-    if ((child = fork()) == 0) {
-        bool status = start_sdcard_fuse(path.c_str());
+    vdc->volumeUnmount(vi.mId, true);
 
-        _exit(status ? EXIT_SUCCESS : EXIT_FAILURE);
-    }
-
-    // FUSE_SIDELOAD_HOST_PATHNAME will start to exist once the fuse in child
-    // process is ready.
-    int result = INSTALL_ERROR;
-    int status;
-    bool waited = false;
-    for (int i = 0; i < SDCARD_INSTALL_TIMEOUT; ++i) {
-        if (waitpid(child, &status, WNOHANG) == -1) {
-            result = INSTALL_ERROR;
-            waited = true;
-            break;
-        }
-
-        struct stat sb;
-        if (stat(FUSE_SIDELOAD_HOST_PATHNAME, &sb) == -1) {
-            if (errno == ENOENT && i < SDCARD_INSTALL_TIMEOUT-1) {
-                sleep(1);
-                continue;
-            } else {
-                LOG(ERROR) << "Timed out waiting for the fuse-provided package.";
-                result = INSTALL_ERROR;
-                kill(child, SIGKILL);
-                break;
-            }
-        }
-
-        result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
+    status = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
                                  TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/);
-        break;
+
+    finish_sdcard_fuse(token);
+    return status;
+}
+
+static int
+show_apply_update_menu(Device* device, bool* wipe_cache) {
+    MenuItemVector items;
+    static const char* headers[] = { "Apply update", nullptr };
+    std::vector<VolumeInfo> volumes = vdc->getVolumes();
+
+refresh:
+    items.push_back(MenuItem("Apply from ADB")); // Index 0
+
+    for (auto& vol : volumes) {
+        items.push_back(MenuItem("Choose from " + vol.mLabel));
     }
 
-    if (!waited) {
-        // Calling stat() on this magic filename signals the fuse
-        // filesystem to shut down.
-        struct stat sb;
-        stat(FUSE_SIDELOAD_HOST_EXIT_PATHNAME, &sb);
+    int status = INSTALL_ERROR;
 
-        waitpid(child, &status, 0);
+    int chosen = get_menu_selection(false, MT_LIST, headers, items,
+                                    false, 0, device);
+    if (chosen == Device::kRefresh) {
+        goto refresh;
+    }
+    if (chosen == Device::kGoBack ||
+        chosen == Device::kGoHome) {
+        return INSTALL_NONE;
+    }
+    if (chosen == 0) {
+        static const char* s_headers[] = { "ADB Sideload", nullptr };
+        static const MenuItemVector s_items = { MenuItem("Cancel sideload") };
+
+        start_sideload(wipe_cache, TEMPORARY_INSTALL_FILE);
+        int item = get_menu_selection(false, MT_LIST, s_headers, s_items,
+                                      false, 0, device);
+        if (item != Device::kNoAction) {
+            stop_sideload();
+        }
+        status = wait_sideload();
+    }
+    else {
+        std::string id = volumes[chosen - 1].mId;
+        status = apply_from_storage(device, id, wipe_cache);
     }
 
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        LOG(ERROR) << "Error exit from the fuse process: " << WEXITSTATUS(status);
-    }
-
-    ensure_path_unmounted(SDCARD_ROOT);
-    return result;
+    return status;
 }
 
 // Returns REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default,
@@ -1118,7 +1228,19 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
     }
     ui->SetProgressType(RecoveryUI::EMPTY);
 
-    int chosen_item = get_menu_selection(nullptr, device->GetMenuItems(), false, 0, device);
+    int chosen_item = get_menu_selection(device->IsMainMenu(),
+                                         device->GetMenuType(),
+                                         nullptr,
+                                         device->GetMenuItems(),
+                                         false, 0, device);
+    if (chosen_item == Device::kGoBack ||
+        chosen_item == Device::kGoHome) {
+      device->GoHome();
+      continue;
+    }
+    if (chosen_item == Device::kRefresh) {
+      continue;
+    }
 
     // Device-specific code may take some action here. It may return one of the core actions
     // handled in the switch statement below.
@@ -1128,6 +1250,8 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
     bool should_wipe_cache = false;
     switch (chosen_action) {
       case Device::NO_ACTION:
+      case Device::WIPE_MENU:
+      case Device::ADVANCED_MENU:
         break;
 
       case Device::REBOOT:
@@ -1151,36 +1275,50 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
         if (!ui->IsTextVisible()) return Device::NO_ACTION;
         break;
 
-      case Device::APPLY_ADB_SIDELOAD:
-      case Device::APPLY_SDCARD:
+      case Device::WIPE_SYSTEM:
+        if (ui->IsTextVisible()) {
+          if (ask_to_wipe_system(device)) {
+            wipe_system(device);
+          }
+        } else {
+          wipe_system(device);
+          return Device::NO_ACTION;
+        }
+        break;
+
+      case Device::APPLY_UPDATE:
         {
-          bool adb = (chosen_action == Device::APPLY_ADB_SIDELOAD);
-          if (adb) {
-            status = apply_from_adb(&should_wipe_cache, TEMPORARY_INSTALL_FILE);
-          } else {
-            status = apply_from_sdcard(device, &should_wipe_cache);
-          }
+          status = show_apply_update_menu(device, &should_wipe_cache);
 
-          if (status == INSTALL_SUCCESS && should_wipe_cache) {
-            if (!wipe_cache(false, device)) {
-              status = INSTALL_ERROR;
+          if (status != INSTALL_NONE) {
+            if (status == INSTALL_SUCCESS && should_wipe_cache) {
+              if (!wipe_cache(false, device)) {
+                status = INSTALL_ERROR;
+              }
             }
-          }
 
-          if (status != INSTALL_SUCCESS) {
-            ui->SetBackground(RecoveryUI::ERROR);
-            ui->Print("Installation aborted.\n");
-            copy_logs();
-          } else if (!ui->IsTextVisible()) {
-            return Device::NO_ACTION;  // reboot if logs aren't visible
-          } else {
-            ui->Print("\nInstall from %s complete.\n", adb ? "ADB" : "SD card");
+            if (status != INSTALL_SUCCESS) {
+              ui->SetProgressType(RecoveryUI::EMPTY);
+              ui->SetBackground(RecoveryUI::ERROR);
+              ui->Print("Installation aborted.\n");
+              ui->Redraw();
+              copy_logs();
+              ui->FlushKeys();
+              ui->WaitInputEvent();
+            } else if (!ui->IsTextVisible()) {
+              return Device::NO_ACTION;  // reboot if logs aren't visible
+            } else {
+              ui->Print("\nInstall complete.\n");
+            }
           }
         }
         break;
 
       case Device::VIEW_RECOVERY_LOGS:
         choose_recovery_file(device);
+        if (chosen_item == Device::kGoHome) {
+          device->GoHome();
+        }
         break;
 
       case Device::RUN_GRAPHICS_TEST:
@@ -1348,6 +1486,60 @@ static void log_failure_code(ErrorCode code, const char *update_package) {
     LOG(INFO) << log_content;
 }
 
+static void copy_userdata_files() {
+    if (ensure_path_mounted("/data") == 0) {
+        if (access(adb_keys_root, F_OK) != 0) {
+            if (access(adb_keys_data, R_OK) == 0) {
+                file_copy(adb_keys_data, adb_keys_root);
+            }
+        }
+        if (access(time_off_root, F_OK) != 0) {
+            if (access(time_off_1_data, R_OK) == 0) {
+                file_copy(time_off_1_data, time_off_root);
+            }
+            else if (access(time_off_2_data, R_OK) == 0) {
+                file_copy(time_off_2_data, time_off_root);
+            }
+        }
+        ensure_path_unmounted("/data");
+    }
+}
+
+static void set_time() {
+    struct timeval now;
+    FILE* fp;
+
+    gettimeofday(&now, nullptr);
+    if (now.tv_sec <= TV_MIN) {
+        fp = fopen(time_off_root, "r");
+        if (fp) {
+            size_t nr;
+            uint64_t off;
+            if (fread(&off, 1, sizeof(off), fp) == sizeof(off)) {
+                now.tv_sec = off / 1000;
+                now.tv_usec = (off % 1000) * 1000;
+                if (now.tv_sec > TV_MIN) {
+                    settimeofday(&now, nullptr);
+                }
+            }
+            fclose(fp);
+        }
+    }
+}
+
+static void setup_adbd() {
+    int tries;
+    for (tries = 0; tries < 5; ++tries) {
+        if (access(adb_keys_root, F_OK) == 0) {
+            break;
+        }
+        sleep(1);
+    }
+
+    // Trigger (re)start of adb daemon
+    property_set("service.adb.root", "1");
+}
+
 int main(int argc, char **argv) {
     // We don't have logcat yet under recovery; so we'll print error on screen and
     // log to stdout (which is redirected to recovery.log) as we used to do.
@@ -1378,16 +1570,43 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    time_t start = time(NULL);
+    // Handle alternative invocations
+    char* command = argv[0];
+    char* stripped = strrchr(argv[0], '/');
+    if (stripped)
+        command = stripped + 1;
+
+    if (strcmp(command, "recovery") != 0) {
+        struct recovery_cmd cmd = get_command(command);
+        if (cmd.name)
+            return cmd.main_func(argc, argv);
+
+        if (!strcmp(command, "setup_adbd")) {
+            setup_adbd();
+            return 0;
+        }
+        LOG(ERROR) << "Unhandled command " << command;
+        return 1;
+    }
+
+    // Clear umask for packages that copy files out to /tmp and then over
+    // to /system without properly setting all permissions (eg. gapps).
+    umask(0);
 
     // redirect_stdio should be called only in non-sideload mode. Otherwise
     // we may have two logger instances with different timestamps.
     redirect_stdio(TEMPORARY_LOG_FILE);
 
-    printf("Starting recovery (pid %d) on %s", getpid(), ctime(&start));
-
     load_volume_table();
     has_cache = volume_for_path(CACHE_ROOT) != nullptr;
+
+    copy_userdata_files();
+    set_time();
+    setup_adbd();
+
+    time_t start = time(NULL);
+
+    printf("Starting recovery (pid %d) on %s", getpid(), ctime(&start));
 
     std::vector<std::string> args = get_args(argc, argv);
     std::vector<char*> args_to_parse(args.size());
@@ -1469,6 +1688,9 @@ int main(int argc, char **argv) {
         }
     }
 
+    vdc = new VoldClient(device);
+    vdc->start();
+
     // Set background string to "installing security update" for security update,
     // otherwise set it to "installing system update".
     ui->SetSystemUpdateText(security_update);
@@ -1497,8 +1719,6 @@ int main(int argc, char **argv) {
 
     property_list(print_property, NULL);
     printf("\n");
-
-    ui->Print("Supported API: %d\n", RECOVERY_API_VERSION);
 
     int status = INSTALL_SUCCESS;
 
@@ -1581,7 +1801,8 @@ int main(int argc, char **argv) {
         if (!sideload_auto_reboot) {
             ui->ShowText(true);
         }
-        status = apply_from_adb(&should_wipe_cache, TEMPORARY_INSTALL_FILE);
+        start_sideload(&should_wipe_cache, TEMPORARY_INSTALL_FILE);
+        status = wait_sideload();
         if (status == INSTALL_SUCCESS && should_wipe_cache) {
             if (!wipe_cache(false, device)) {
                 status = INSTALL_ERROR;
@@ -1592,12 +1813,10 @@ int main(int argc, char **argv) {
             ui->Print("Rebooting automatically.\n");
         }
     } else if (!just_exit) {
-      // If this is an eng or userdebug build, automatically turn on the text display if no command
-      // is specified. Note that this should be called before setting the background to avoid
+      // Always show menu if no command is specified
+      // Note that this should be called before setting the background to avoid
       // flickering the background image.
-      if (is_ro_debuggable()) {
-        ui->ShowText(true);
-      }
+      ui->ShowText(true);
       status = INSTALL_NONE;  // No command specified
       ui->SetBackground(RecoveryUI::NO_COMMAND);
     }
@@ -1605,6 +1824,7 @@ int main(int argc, char **argv) {
     if (status == INSTALL_ERROR || status == INSTALL_CORRUPT) {
         ui->SetBackground(RecoveryUI::ERROR);
         if (!ui->IsTextVisible()) {
+            ui->Redraw();
             sleep(5);
         }
     }
@@ -1627,6 +1847,13 @@ int main(int argc, char **argv) {
     // Save logs and clean up before rebooting or shutting down.
     finish_recovery();
 
+    vdc->unmountAll();
+    vdc->stop();
+
+    sync();
+
+    ui->Stop();
+
     switch (after) {
         case Device::SHUTDOWN:
             ui->Print("Shutting down...\n");
@@ -1634,8 +1861,13 @@ int main(int argc, char **argv) {
             break;
 
         case Device::REBOOT_BOOTLOADER:
+#ifdef DOWNLOAD_MODE
+            ui->Print("Rebooting to download mode...\n");
+            android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,download");
+#else
             ui->Print("Rebooting to bootloader...\n");
             android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,bootloader");
+#endif
             break;
 
         default:

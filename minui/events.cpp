@@ -77,9 +77,14 @@ int ev_init(ev_callback input_cb, bool allow_touch_inputs) {
         continue;
       }
 
-      // We assume that only EV_KEY, EV_REL, and EV_SW event types are ever needed. EV_ABS is also
+      // We assume that only EV_KEY, and EV_SW event types are ever needed. EV_ABS is also
       // allowed if allow_touch_inputs is set.
-      if (!test_bit(EV_KEY, ev_bits) && !test_bit(EV_REL, ev_bits) && !test_bit(EV_SW, ev_bits)) {
+      // EV_REL should be enabled explicitly in device tree.
+      if (!test_bit(EV_KEY, ev_bits) &&
+#ifdef BOARD_RECOVERY_NEEDS_REL_INPUT
+          !test_bit(EV_REL, ev_bits) &&
+#endif
+          !test_bit(EV_SW, ev_bits)) {
         if (!allow_touch_inputs || !test_bit(EV_ABS, ev_bits)) {
           close(fd);
           continue;
@@ -233,7 +238,8 @@ void ev_iterate_available_keys(const std::function<void(int)>& f) {
     }
 }
 
-void ev_iterate_touch_inputs(const std::function<void(int)>& action) {
+void ev_iterate_touch_inputs(const std::function<void(int)>& touch_device_detected,
+                             const std::function<void(int)>& key_detected) {
   for (size_t i = 0; i < ev_dev_count; ++i) {
     // Use unsigned long to match ioctl's parameter type.
     unsigned long ev_bits[BITS_TO_LONGS(EV_MAX)] = {};  // NOLINT
@@ -249,9 +255,11 @@ void ev_iterate_touch_inputs(const std::function<void(int)>& action) {
       continue;
     }
 
+    touch_device_detected(ev_fdinfo[i].fd);
+
     for (int key_code = 0; key_code <= KEY_MAX; ++key_code) {
       if (test_bit(key_code, key_bits)) {
-        action(key_code);
+        key_detected(key_code);
       }
     }
   }

@@ -22,9 +22,9 @@ LOCAL_SRC_FILES := \
     ThermalUtil.cpp
 
 LOCAL_STATIC_LIBRARIES := \
+    libziparchive \
     libselinux \
-    libbase \
-    libziparchive
+    libbase
 
 LOCAL_MODULE := libotautil
 LOCAL_CFLAGS := \

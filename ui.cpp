@@ -39,6 +39,7 @@
 #include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <cutils/android_reboot.h>
+#include <cutils/properties.h>
 #include <minui/minui.h>
 
 #include "common.h"
@@ -54,10 +55,11 @@ RecoveryUI::RecoveryUI()
       rtl_locale_(false),
       brightness_normal_(50),
       brightness_dimmed_(25),
-      touch_screen_allowed_(false),
+      touch_screen_allowed_(true),
+      volumes_changed_(false),
       kTouchLowThreshold(RECOVERY_UI_TOUCH_LOW_THRESHOLD),
       kTouchHighThreshold(RECOVERY_UI_TOUCH_HIGH_THRESHOLD),
-      key_queue_len(0),
+      event_queue_len(0),
       key_last_down(-1),
       key_long_press(false),
       key_down_count(0),
@@ -69,11 +71,65 @@ RecoveryUI::RecoveryUI()
       has_down_key(false),
       has_touch_screen(false),
       touch_slot_(0),
+      touch_finger_down_(false),
+      touch_saw_x_(false),
+      touch_saw_y_(false),
+      touch_reported_(false),
       is_bootreason_recovery_ui_(false),
       screensaver_state_(ScreensaverState::DISABLED) {
-  pthread_mutex_init(&key_queue_mutex, nullptr);
-  pthread_cond_init(&key_queue_cond, nullptr);
+  char propval[PROPERTY_VALUE_MAX];
+  property_get("ro.build.version.release", propval, "(unknown)");
+  android_version_ = std::string("Android ") + propval;
+  property_get("ro.lineage.version", propval, "(unknown)");
+  lineage_version_ = std::string("LineageOS ") + propval;
+
+  pthread_mutex_init(&event_queue_mutex, nullptr);
+  pthread_cond_init(&event_queue_cond, nullptr);
   memset(key_pressed, 0, sizeof(key_pressed));
+}
+
+void RecoveryUI::OnTouchDeviceDetected(int fd) {
+  char name[256];
+  char path[PATH_MAX];
+  char buf[4096];
+
+  memset(name, 0, sizeof(name));
+  if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0) {
+    return;
+  }
+  sprintf(path, "/sys/board_properties/virtualkeys.%s", name);
+  int vkfd = open(path, O_RDONLY);
+  if (vkfd < 0) {
+    LOG(INFO) << "vkeys: could not open " << path;
+    return;
+  }
+  ssize_t len = read(vkfd, buf, sizeof(buf));
+  close(vkfd);
+  if (len <= 0) {
+    LOG(ERROR) << "vkeys: could not read " << path;
+    return;
+  }
+  buf[len] = '\0';
+
+  char* p = buf;
+  char* endp;
+  for (size_t n = 0; p < buf+len && *p == '0'; ++n) {
+    int val[6];
+    int f;
+    for (f = 0; *p && f < 6; ++f) {
+      val[f] = strtol(p, &endp, 0);
+      if (p == endp)
+        break;
+      p = endp+1;
+    }
+    if (f != 6 || val[0] != 0x01)
+      break;
+    vkey_t vk;
+    vk.keycode = val[1];
+    vk.min_ = Point(val[2] - val[4]/2, val[3] - val[5]/2);
+    vk.max_ = Point(val[2] + val[4]/2, val[3] + val[5]/2);
+    virtual_keys_.push_back(vk);
+  }
 }
 
 void RecoveryUI::OnKeyDetected(int key_code) {
@@ -142,7 +198,8 @@ bool RecoveryUI::Init(const std::string& locale) {
   ev_iterate_available_keys(std::bind(&RecoveryUI::OnKeyDetected, this, std::placeholders::_1));
 
   if (touch_screen_allowed_) {
-    ev_iterate_touch_inputs(std::bind(&RecoveryUI::OnKeyDetected, this, std::placeholders::_1));
+    ev_iterate_touch_inputs(std::bind(&RecoveryUI::OnTouchDeviceDetected, this, std::placeholders::_1),
+                            std::bind(&RecoveryUI::OnKeyDetected, this, std::placeholders::_1));
 
     // Parse /proc/cmdline to determine if it's booting into recovery with a bootreason of
     // "recovery_ui". This specific reason is set by some (wear) bootloaders, to allow an easier way
@@ -166,46 +223,63 @@ bool RecoveryUI::Init(const std::string& locale) {
   return true;
 }
 
-void RecoveryUI::OnTouchDetected(int dx, int dy) {
-  enum SwipeDirection { UP, DOWN, RIGHT, LEFT } direction;
+void RecoveryUI::Stop() {
+  !android::base::WriteStringToFile("0", BRIGHTNESS_FILE);
+}
 
-  // We only consider a valid swipe if:
-  // - the delta along one axis is below kTouchLowThreshold;
-  // - and the delta along the other axis is beyond kTouchHighThreshold.
-  if (abs(dy) < kTouchLowThreshold && abs(dx) > kTouchHighThreshold) {
-    direction = dx < 0 ? SwipeDirection::LEFT : SwipeDirection::RIGHT;
-  } else if (abs(dx) < kTouchLowThreshold && abs(dy) > kTouchHighThreshold) {
-    direction = dy < 0 ? SwipeDirection::UP : SwipeDirection::DOWN;
-  } else {
-    LOG(DEBUG) << "Ignored " << dx << " " << dy << " (low: " << kTouchLowThreshold
-               << ", high: " << kTouchHighThreshold << ")";
-    return;
+void RecoveryUI::OnTouchPress() {
+  touch_start_ = touch_track_ = touch_pos_;
+}
+
+void RecoveryUI::OnTouchTrack() {
+  if (touch_pos_.y() <= gr_fb_height()) {
+    if (MenuShowing() && MenuScrollable()) {
+      while (abs(touch_pos_.y() - touch_track_.y()) >= MenuItemHeight()) {
+        int dy = touch_pos_.y() - touch_track_.y();
+        int key = (dy < 0) ? KEY_VOLUMEUP : KEY_VOLUMEDOWN;
+        ProcessKey(key, 1); // press key
+        ProcessKey(key, 0); // and release it
+        int sgn = (dy > 0) - (dy < 0);
+        touch_track_.y(touch_track_.y() + sgn * MenuItemHeight());
+      }
+    }
   }
+}
 
+void RecoveryUI::OnTouchRelease() {
   // Allow turning on text mode with any swipe, if bootloader has set a bootreason of recovery_ui.
   if (is_bootreason_recovery_ui_ && !IsTextVisible()) {
     ShowText(true);
     return;
   }
 
-  LOG(DEBUG) << "Swipe direction=" << direction;
-  switch (direction) {
-    case SwipeDirection::UP:
-      ProcessKey(KEY_UP, 1);  // press up key
-      ProcessKey(KEY_UP, 0);  // and release it
-      break;
+  // Check vkeys.  Only report if touch both starts and ends in the vkey.
+  if (touch_start_.y() > gr_fb_height() && touch_pos_.y() > gr_fb_height()) {
+    for (const auto& vk : virtual_keys_) {
+      if (vk.inside(touch_start_) && vk.inside(touch_pos_)) {
+        ProcessKey(vk.keycode, 1);  // press key
+        ProcessKey(vk.keycode, 0);  // and release it
+      }
+    }
+    return;
+  }
 
-    case SwipeDirection::DOWN:
-      ProcessKey(KEY_DOWN, 1);  // press down key
-      ProcessKey(KEY_DOWN, 0);  // and release it
-      break;
+  // If we tracked a vertical swipe, ignore the release
+  if (touch_track_ != touch_start_) {
+    return;
+  }
 
-    case SwipeDirection::LEFT:
-    case SwipeDirection::RIGHT:
-      ProcessKey(KEY_POWER, 1);  // press power key
-      ProcessKey(KEY_POWER, 0);  // and release it
-      break;
-  };
+  // Check for horizontal swipe
+  Point delta = touch_pos_ - touch_start_;
+  if (abs(delta.y()) < kTouchLowThreshold && abs(delta.x()) > kTouchHighThreshold) {
+    int key = (delta.x() < 0) ? KEY_BACK : KEY_POWER;
+    ProcessKey(key, 1); // press key
+    ProcessKey(key, 0); // and release it
+    return;
+  }
+
+  // Simple touch
+  EnqueueTouch(touch_pos_);
 }
 
 int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
@@ -215,10 +289,6 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
   }
 
   // Touch inputs handling.
-  //
-  // We handle the touch inputs by tracking the position changes between initial contacting and
-  // upon lifting. touch_start_X/Y record the initial positions, with touch_finger_down set. Upon
-  // detecting the lift, we unset touch_finger_down and detect a swipe based on position changes.
   //
   // Per the doc Multi-touch Protocol at below, there are two protocols.
   // https://www.kernel.org/doc/Documentation/input/multi-touch-protocol.txt
@@ -236,15 +306,17 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
 
   if (ev.type == EV_SYN) {
     if (touch_screen_allowed_ && ev.code == SYN_REPORT) {
-      // There might be multiple SYN_REPORT events. We should only detect a swipe after lifting the
-      // contact.
-      if (touch_finger_down_ && !touch_swiping_) {
-        touch_start_X_ = touch_X_;
-        touch_start_Y_ = touch_Y_;
-        touch_swiping_ = true;
-      } else if (!touch_finger_down_ && touch_swiping_) {
-        touch_swiping_ = false;
-        OnTouchDetected(touch_X_ - touch_start_X_, touch_Y_ - touch_start_Y_);
+      // There might be multiple SYN_REPORT events. Only report press/release once.
+      if (!touch_reported_ && touch_finger_down_) {
+        if (touch_saw_x_ && touch_saw_y_) {
+          OnTouchPress();
+          touch_reported_ = true;
+          touch_saw_x_ = touch_saw_y_ = false;
+        }
+      } else if (touch_reported_ && !touch_finger_down_) {
+        OnTouchRelease();
+        touch_reported_ = false;
+        touch_saw_x_ = touch_saw_y_ = false;
       }
     }
     return 0;
@@ -280,13 +352,23 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
 
     switch (ev.code) {
       case ABS_MT_POSITION_X:
-        touch_X_ = ev.value;
         touch_finger_down_ = true;
+        touch_saw_x_ = true;
+        touch_pos_.x(ev.value);
+        if (touch_reported_ && touch_saw_y_) {
+          OnTouchTrack();
+          touch_saw_x_ = touch_saw_y_ = false;
+        }
         break;
 
       case ABS_MT_POSITION_Y:
-        touch_Y_ = ev.value;
         touch_finger_down_ = true;
+        touch_saw_y_ = true;
+        touch_pos_.y(ev.value);
+        if (touch_reported_ && touch_saw_x_) {
+          OnTouchTrack();
+          touch_saw_x_ = touch_saw_y_ = false;
+        }
         break;
 
       case ABS_MT_TRACKING_ID:
@@ -336,7 +418,7 @@ void RecoveryUI::ProcessKey(int key_code, int updown) {
   bool long_press = false;
   bool reboot_enabled;
 
-  pthread_mutex_lock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
   key_pressed[key_code] = updown;
   if (updown) {
     ++key_down_count;
@@ -357,7 +439,7 @@ void RecoveryUI::ProcessKey(int key_code, int updown) {
     key_last_down = -1;
   }
   reboot_enabled = enable_reboot;
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
 
   if (register_key) {
     switch (CheckKey(key_code, long_press)) {
@@ -370,6 +452,9 @@ void RecoveryUI::ProcessKey(int key_code, int updown) {
 
       case RecoveryUI::REBOOT:
         if (reboot_enabled) {
+#ifndef VERIFIER_TEST
+          vdc->unmountAll();
+#endif
           reboot("reboot,");
           while (true) {
             pause();
@@ -394,26 +479,38 @@ void* RecoveryUI::time_key_helper(void* cookie) {
 void RecoveryUI::time_key(int key_code, int count) {
   usleep(750000);  // 750 ms == "long"
   bool long_press = false;
-  pthread_mutex_lock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
   if (key_last_down == key_code && key_down_count == count) {
     long_press = key_long_press = true;
   }
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
   if (long_press) KeyLongPress(key_code);
 }
 
 void RecoveryUI::EnqueueKey(int key_code) {
-  pthread_mutex_lock(&key_queue_mutex);
-  const int queue_max = sizeof(key_queue) / sizeof(key_queue[0]);
-  if (key_queue_len < queue_max) {
-    key_queue[key_queue_len++] = key_code;
-    pthread_cond_signal(&key_queue_cond);
+  pthread_mutex_lock(&event_queue_mutex);
+  const int queue_max = sizeof(event_queue) / sizeof(event_queue[0]);
+  if (event_queue_len < queue_max) {
+    InputEvent event(key_code);
+    event_queue[event_queue_len++] = event;
+    pthread_cond_signal(&event_queue_cond);
   }
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
 }
 
-int RecoveryUI::WaitKey() {
-  pthread_mutex_lock(&key_queue_mutex);
+void RecoveryUI::EnqueueTouch(const Point& pos) {
+  pthread_mutex_lock(&event_queue_mutex);
+  const int queue_max = sizeof(event_queue) / sizeof(event_queue[0]);
+  if (event_queue_len < queue_max) {
+    InputEvent event(pos);
+    event_queue[event_queue_len++] = event;
+    pthread_cond_signal(&event_queue_cond);
+  }
+  pthread_mutex_unlock(&event_queue_mutex);
+}
+
+RecoveryUI::InputEvent RecoveryUI::WaitInputEvent() {
+  pthread_mutex_lock(&event_queue_mutex);
 
   // Time out after UI_WAIT_KEY_TIMEOUT_SEC, unless a USB cable is
   // plugged in.
@@ -426,8 +523,23 @@ int RecoveryUI::WaitKey() {
     timeout.tv_sec += UI_WAIT_KEY_TIMEOUT_SEC;
 
     int rc = 0;
-    while (key_queue_len == 0 && rc != ETIMEDOUT) {
-      rc = pthread_cond_timedwait(&key_queue_cond, &key_queue_mutex, &timeout);
+    while (event_queue_len == 0 && rc != ETIMEDOUT) {
+      struct timespec key_timeout;
+      gettimeofday(&now, nullptr);
+      key_timeout.tv_sec = now.tv_sec + 1;
+      key_timeout.tv_nsec = now.tv_usec * 1000;
+      rc = pthread_cond_timedwait(&event_queue_cond, &event_queue_mutex, &key_timeout);
+      if (rc == ETIMEDOUT) {
+        if (VolumesChanged()) {
+          pthread_mutex_unlock(&event_queue_mutex);
+          InputEvent event(KEY_REFRESH);
+          return event;
+        }
+        if (key_timeout.tv_sec <= timeout.tv_sec) {
+          rc = 0;
+          ui->Redraw();
+        }
+      }
     }
 
     if (screensaver_state_ != ScreensaverState::DISABLED) {
@@ -449,8 +561,8 @@ int RecoveryUI::WaitKey() {
       } else if (screensaver_state_ != ScreensaverState::NORMAL) {
         // Drop the first key if it's changing from OFF to NORMAL.
         if (screensaver_state_ == ScreensaverState::OFF) {
-          if (key_queue_len > 0) {
-            memcpy(&key_queue[0], &key_queue[1], sizeof(int) * --key_queue_len);
+          if (event_queue_len > 0) {
+            memcpy(&event_queue[0], &event_queue[1], sizeof(int) * --event_queue_len);
           }
         }
 
@@ -463,15 +575,24 @@ int RecoveryUI::WaitKey() {
         }
       }
     }
-  } while (IsUsbConnected() && key_queue_len == 0);
+  } while (IsUsbConnected() && event_queue_len == 0);
 
-  int key = -1;
-  if (key_queue_len > 0) {
-    key = key_queue[0];
-    memcpy(&key_queue[0], &key_queue[1], sizeof(int) * --key_queue_len);
+  InputEvent event;
+  if (event_queue_len > 0) {
+    event = event_queue[0];
+    memcpy(&event_queue[0], &event_queue[1], sizeof(event_queue[0]) * --event_queue_len);
   }
-  pthread_mutex_unlock(&key_queue_mutex);
-  return key;
+  pthread_mutex_unlock(&event_queue_mutex);
+  return event;
+}
+
+void RecoveryUI::CancelWaitKey()
+{
+    pthread_mutex_lock(&event_queue_mutex);
+    InputEvent event(KEY_REFRESH);
+    event_queue[event_queue_len++] = event;
+    pthread_cond_signal(&event_queue_cond);
+    pthread_mutex_unlock(&event_queue_mutex);
 }
 
 bool RecoveryUI::IsUsbConnected() {
@@ -491,16 +612,16 @@ bool RecoveryUI::IsUsbConnected() {
 }
 
 bool RecoveryUI::IsKeyPressed(int key) {
-  pthread_mutex_lock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
   int pressed = key_pressed[key];
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
   return pressed;
 }
 
 bool RecoveryUI::IsLongPress() {
-  pthread_mutex_lock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
   bool result = key_long_press;
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
   return result;
 }
 
@@ -517,15 +638,15 @@ bool RecoveryUI::HasTouchScreen() const {
 }
 
 void RecoveryUI::FlushKeys() {
-  pthread_mutex_lock(&key_queue_mutex);
-  key_queue_len = 0;
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
+  event_queue_len = 0;
+  pthread_mutex_unlock(&event_queue_mutex);
 }
 
 RecoveryUI::KeyAction RecoveryUI::CheckKey(int key, bool is_long_press) {
-  pthread_mutex_lock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
   key_long_press = false;
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
 
   // If we have power and volume up keys, that chord is the signal to toggle the text display.
   if (HasThreeButtons() || (HasPowerKey() && HasTouchScreen() && touch_screen_allowed_)) {
@@ -548,9 +669,9 @@ RecoveryUI::KeyAction RecoveryUI::CheckKey(int key, bool is_long_press) {
 
   // Press power seven times in a row to reboot.
   if (key == KEY_POWER) {
-    pthread_mutex_lock(&key_queue_mutex);
+    pthread_mutex_lock(&event_queue_mutex);
     bool reboot_enabled = enable_reboot;
-    pthread_mutex_unlock(&key_queue_mutex);
+    pthread_mutex_unlock(&event_queue_mutex);
 
     if (reboot_enabled) {
       ++consecutive_power_keys;
@@ -570,9 +691,9 @@ void RecoveryUI::KeyLongPress(int) {
 }
 
 void RecoveryUI::SetEnableReboot(bool enabled) {
-  pthread_mutex_lock(&key_queue_mutex);
+  pthread_mutex_lock(&event_queue_mutex);
   enable_reboot = enabled;
-  pthread_mutex_unlock(&key_queue_mutex);
+  pthread_mutex_unlock(&event_queue_mutex);
 }
 
 void RecoveryUI::SetLocale(const std::string& new_locale) {
@@ -593,4 +714,10 @@ void RecoveryUI::SetLocale(const std::string& new_locale) {
       rtl_locale_ = true;
     }
   }
+}
+
+bool RecoveryUI::VolumesChanged() {
+    bool ret = volumes_changed_;
+    volumes_changed_ = false;
+    return ret;
 }

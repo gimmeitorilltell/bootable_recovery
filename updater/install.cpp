@@ -34,6 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
+#include <blkid/blkid.h>
 
 #include <memory>
 #include <string>
@@ -138,7 +139,7 @@ Value* MountFn(const char* name, State* state, const std::vector<std::unique_ptr
   if (!ReadArgs(state, argv, &args)) {
     return ErrorAbort(state, kArgsParsingFailure, "%s() Failed to parse the argument(s)", name);
   }
-  const std::string& fs_type = args[0];
+  std::string& fs_type = args[0];
   const std::string& partition_type = args[1];
   const std::string& location = args[2];
   const std::string& mount_point = args[3];
@@ -177,6 +178,20 @@ Value* MountFn(const char* name, State* state, const std::vector<std::unique_ptr
       freecon(secontext);
       setfscreatecon(nullptr);
     }
+  }
+
+  std::string detected_fs_type;
+  char *val = blkid_get_tag_value(NULL, "TYPE", location.c_str());
+  if (val) {
+      detected_fs_type = val;
+  }
+  if (!detected_fs_type.empty()) {
+      uiPrintf(state, "detected filesystem %s for %s\n",
+              detected_fs_type.c_str(), location.c_str());
+      fs_type = detected_fs_type;
+  } else {
+      uiPrintf(state, "could not detect filesystem for %s, assuming %s\n",
+              location.c_str(), fs_type.c_str());
   }
 
   if (mount(location.c_str(), mount_point.c_str(), fs_type.c_str(),
@@ -339,15 +354,32 @@ Value* FormatFn(const char* name, State* state, const std::vector<std::unique_pt
     std::string num_sectors = std::to_string(size / 512);
 
     const char* f2fs_path = "/sbin/mkfs.f2fs";
-    const char* f2fs_argv[] = {
-      "mkfs.f2fs", "-t", "-d1", location.c_str(), (size < 512) ? nullptr : num_sectors.c_str(),
-      nullptr
-    };
+    const char* f2fs_argv[] = { "mkfs.f2fs",
+                                "-d1",
+                                "-f",
+                                "-O",
+                                "encrypt",
+                                "-O",
+                                "quota",
+                                "-w",
+                                "512",
+                                location.c_str(),
+                                (size < 512) ? nullptr : num_sectors.c_str(),
+                                nullptr };
     int status = exec_cmd(f2fs_path, const_cast<char**>(f2fs_argv));
     if (status != 0) {
       LOG(ERROR) << name << ": mkfs.f2fs failed (" << status << ") on " << location;
       return StringValue("");
     }
+
+    const char* sload_argv[] = { "/sbin/sload.f2fs", "-t", mount_point.c_str(), location.c_str(),
+                                 nullptr };
+    status = exec_cmd(sload_argv[0], const_cast<char**>(sload_argv));
+    if (status != 0) {
+      LOG(ERROR) << name << ": sload.f2fs failed (" << status << ") on " << location;
+      return StringValue("");
+    }
+
     return StringValue(location);
   } else {
     LOG(ERROR) << name << ": unsupported fs_type \"" << fs_type << "\" partition_type \""
@@ -362,7 +394,8 @@ Value* FormatFn(const char* name, State* state, const std::vector<std::unique_pt
 //   Example: rename("system/app/Hangouts/Hangouts.apk", "system/priv-app/Hangouts/Hangouts.apk")
 Value* RenameFn(const char* name, State* state, const std::vector<std::unique_ptr<Expr>>& argv) {
   if (argv.size() != 2) {
-    return ErrorAbort(state, kArgsParsingFailure, "%s() expects 2 args, got %zu", name, argv.size());
+    return ErrorAbort(state, kArgsParsingFailure, "%s() expects 2 args, got %zu", name,
+                      argv.size());
   }
 
   std::vector<std::string> args;
@@ -399,18 +432,16 @@ Value* RenameFn(const char* name, State* state, const std::vector<std::unique_pt
 //   Recursively deletes dirnames and all their contents. Returns the number of directories
 //   successfully deleted.
 Value* DeleteFn(const char* name, State* state, const std::vector<std::unique_ptr<Expr>>& argv) {
-  std::vector<std::string> paths(argv.size());
-  for (size_t i = 0; i < argv.size(); ++i) {
-    if (!Evaluate(state, argv[i], &paths[i])) {
-      return nullptr;
-    }
+  std::vector<std::string> paths;
+  if (!ReadArgs(state, argv, &paths)) {
+    return nullptr;
   }
 
   bool recursive = (strcmp(name, "delete_recursive") == 0);
 
   int success = 0;
-  for (size_t i = 0; i < argv.size(); ++i) {
-    if ((recursive ? dirUnlinkHierarchy(paths[i].c_str()) : unlink(paths[i].c_str())) == 0) {
+  for (const auto& path : paths) {
+    if ((recursive ? dirUnlinkHierarchy(path.c_str()) : unlink(path.c_str())) == 0) {
       ++success;
     }
   }
@@ -597,18 +628,20 @@ Value* SymlinkFn(const char* name, State* state, const std::vector<std::unique_p
   if (argv.size() == 0) {
     return ErrorAbort(state, kArgsParsingFailure, "%s() expects 1+ args, got %zu", name, argv.size());
   }
-  std::string target;
-  if (!Evaluate(state, argv[0], &target)) {
-    return nullptr;
-  }
 
-  std::vector<std::string> srcs;
-  if (!ReadArgs(state, argv, &srcs, 1, argv.size() - 1)) {
+  std::vector<std::string> args;
+  if (!ReadArgs(state, argv, &args)) {
     return ErrorAbort(state, kArgsParsingFailure, "%s(): Failed to parse the argument(s)", name);
   }
 
+  const auto& target = args[0];
+  if (target.empty()) {
+    return ErrorAbort(state, kArgsParsingFailure, "%s() target argument can't be empty", name);
+  }
+
   size_t bad = 0;
-  for (const auto& src : srcs) {
+  for (size_t i = 1; i < args.size(); ++i) {
+    const auto& src = args[i];
     if (unlink(src.c_str()) == -1 && errno != ENOENT) {
       PLOG(ERROR) << name << ": failed to remove " << src;
       ++bad;
@@ -1228,10 +1261,11 @@ Value* WriteValueFn(const char* name, State* state, const std::vector<std::uniqu
 // current package (because nothing has cleared the copy of the
 // arguments stored in the BCB).
 //
-// The argument is the partition name passed to the android reboot
-// property.  It can be "recovery" to boot from the recovery
-// partition, or "" (empty string) to boot from the regular boot
-// partition.
+// The first argument is the block device for the misc partition
+// ("/misc" in the fstab).  The second argument is the argument
+// passed to the android reboot property.  It can be "recovery" to
+// boot from the recovery partition, or "" (empty string) to boot
+// from the regular boot partition.
 Value* RebootNowFn(const char* name, State* state, const std::vector<std::unique_ptr<Expr>>& argv) {
   if (argv.size() != 2) {
     return ErrorAbort(state, kArgsParsingFailure, "%s() expects 2 args, got %zu", name,
@@ -1265,6 +1299,13 @@ Value* RebootNowFn(const char* name, State* state, const std::vector<std::unique
   android::base::SetProperty(ANDROID_RB_PROPERTY, reboot_cmd);
 
   sleep(5);
+
+  // Attempt to reboot using older methods in case the recovery
+  // that we are updating does not support init reboots
+  android_reboot(ANDROID_RB_RESTART, 0, 0);
+
+  sleep(5);
+
   return ErrorAbort(state, kRebootFailure, "%s() failed to reboot", name);
 }
 
